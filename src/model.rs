@@ -61,10 +61,14 @@ impl BigramLM {
         device: &Device,
     ) -> SmolResult<Self> {
         let mut var_map = VarMap::new();
+        let var_builder = VarBuilder::from_varmap(&var_map, DType::F32, device);
+        let embeddings = var_builder.get_with_hints(
+            (vocab_size, hidden_size),
+            "embeddings",
+            Init::Const(0.0),
+        )?;
         var_map.load(path)?;
 
-        let var_builder = VarBuilder::from_varmap(&var_map, DType::F32, device);
-        let embeddings = var_builder.get((vocab_size, hidden_size), "embeddings")?;
         let token_embedding = Embedding::new(embeddings, hidden_size);
         let rng = rand::rng();
 
@@ -93,7 +97,7 @@ impl BigramLM {
                 &logits.reshape((batch_size * time_size, channel_size))?,
                 &stacked_y.reshape((batch_size * time_size,))?,
             )?;
-            // Looks like optimizer.zero_grad()?; is not required in candle because gradients are accumulated externally
+            // Looks like params.zero_grad()?; is not required in candle because gradients are accumulated externally
             let grads = loss.backward()?;
             optimizer.step(&grads)?;
 
@@ -139,5 +143,36 @@ pub fn sample_multinomial(rng: &mut ThreadRng, prs: &Vec<f32>) -> SmolResult<u32
     Ok(next_token)
 }
 
-#[expect(dead_code)]
-pub struct Gpt {}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use temp_dir::TempDir;
+
+    #[test]
+    fn test_bigram_lm_save_load_preserves_weights() {
+        let device = Device::Cpu;
+        let vocab_size = 100;
+        let hidden_size = 64;
+        let model = BigramLM::new(vocab_size, hidden_size, &device).unwrap();
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bigram_lm.pt");
+        model.save(&path).unwrap();
+
+        let loaded_model = BigramLM::load(&path, vocab_size, hidden_size, &device).unwrap();
+
+        assert_eq!(model.vocab_size, loaded_model.vocab_size);
+
+        let original_embeddings = model.token_embedding.embeddings().to_vec2::<f32>().unwrap();
+        let loaded_embeddings = loaded_model
+            .token_embedding
+            .embeddings()
+            .to_vec2::<f32>()
+            .unwrap();
+
+        // Check actual values as well. Tensor doesn't implement PartialEq, so we compare the data.
+        assert_eq!(original_embeddings, loaded_embeddings);
+
+        std::fs::remove_file(path).unwrap(); // Clean up
+    }
+}

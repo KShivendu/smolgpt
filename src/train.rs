@@ -12,6 +12,8 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
         dataset_path,
         model_path,
         epochs,
+        train,
+        generate,
     } = args;
     let corpus = dataset::load_corpus(&dataset_path, false);
     let tokenizer = SimpleTokenizer::new(&corpus);
@@ -33,6 +35,12 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
     let num_batches = 64;
     let vocab_size = tokenizer.vocab_size();
 
+    if !args.train && !args.generate {
+        return Err(SmolError::invalid_argument(
+            "Either --train or --generate must be specified",
+        ));
+    }
+
     let mut model = if model_path.exists() {
         println!("Loading model from {}", model_path.display());
         BigramLM::load(&model_path, vocab_size, vocab_size, &device)?
@@ -40,13 +48,16 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
         BigramLM::new(vocab_size, vocab_size, &device)?
     };
 
-    model.train(&mut dataset, epochs, num_batches)?;
-    model.save(&model_path)?;
+    if train {
+        model.train(&mut dataset, epochs, num_batches)?;
+        model.save(&model_path)?;
+    }
 
-    let output = model.generate(500, &device)?;
-    let decoded_output = tokenizer.decode(&output);
-
-    println!("Generated text:\n{}", decoded_output);
+    if generate {
+        let output = model.generate(500, &device)?;
+        let decoded_output = tokenizer.decode(&output);
+        println!("Generated text: {decoded_output}");
+    }
 
     Ok(())
 }
