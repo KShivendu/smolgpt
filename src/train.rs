@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use crate::{
     args::Args,
     dataset::{self, Dataset},
@@ -49,7 +51,9 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
     };
 
     if train {
+        let now = Instant::now();
         model.train(&mut dataset, epochs, num_batches)?;
+        println!("Training completed in {:.2?}", now.elapsed());
         model.save(&model_path)?;
     }
 

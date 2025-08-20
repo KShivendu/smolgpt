@@ -16,9 +16,10 @@ smolgpt --epochs 1000 --train --generate
 From BigramLM:
 
 ```console
-$ smolgpt -e 3500 --train --generate
+$ smolgpt -e 4000 --train --generate
 
-Epoch 3200/3200: Loss = 2.5841358
+Epoch 4000/4000: Loss = 2.5262532
+Training completed in 23.88s
 Generated text:
 LI mar th n--O:' ISTh oues,
 I sealyo be.ME:nd bl3BENOistreanspontharatheQ;
