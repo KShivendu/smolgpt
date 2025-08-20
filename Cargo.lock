@@ -128,6 +128,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-nn"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1980d53280c8f9e2c6cbe1785855d7ff8010208b46e21252b978badf13ad69d"
+dependencies = [
+ "candle-core",
+ "half",
+ "num-traits",
+ "rayon",
+ "safetensors",
+ "serde",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -981,6 +996,7 @@ name = "smolgpt"
 version = "0.1.0"
 dependencies = [
  "candle-core",
+ "candle-nn",
  "clap",
  "rand",
  "thiserror 2.0.15",

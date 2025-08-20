@@ -7,8 +7,9 @@ cargo run
 ./target/debug/smolgpt --help
 ```
 
-### Useful repositories
+### Useful links
 
+- https://www.youtube.com/watch?v=kCc8FmEb1nY
 - https://github.com/jeroenvlek/gpt-from-scratch-rs
 - https://github.com/keyvank/femtoGPT
 - https://github.com/Murattut/RustGpt

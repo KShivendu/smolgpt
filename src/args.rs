@@ -12,6 +12,10 @@ pub struct Args {
     /// The path to the dataset file.
     #[clap(short, long, default_value = "data/tinyshakespeare.txt")]
     pub dataset_path: PathBuf,
+
+    /// The path to the dataset file.
+    #[clap(short, long, default_value = "100")]
+    pub epochs: usize,
 }
 
 pub fn parse_args() -> Args {

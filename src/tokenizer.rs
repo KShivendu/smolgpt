@@ -1,10 +1,10 @@
 use std::collections::HashSet;
 
-type DefaultVecType = u32;
+type DefaultTokenIdType = u32;
 
-pub trait Tokenizer<VecType = DefaultVecType> {
-    fn encode(&self, text: &str) -> Vec<VecType>;
-    fn decode(&self, tokens: &[VecType]) -> String;
+pub trait Tokenizer<TokenId> {
+    fn encode(&self, text: &str) -> Vec<TokenId>;
+    fn decode(&self, tokens: &[TokenId]) -> String;
 }
 
 pub struct SimpleTokenizer {
@@ -18,16 +18,20 @@ impl SimpleTokenizer {
         charset.sort(); // Sort to ensure deterministic order
         SimpleTokenizer { charset }
     }
+
+    pub fn vocab_size(&self) -> usize {
+        self.charset.len()
+    }
 }
 
-impl Tokenizer<DefaultVecType> for SimpleTokenizer {
-    fn encode(&self, text: &str) -> Vec<DefaultVecType> {
+impl Tokenizer<DefaultTokenIdType> for SimpleTokenizer {
+    fn encode(&self, text: &str) -> Vec<DefaultTokenIdType> {
         text.chars()
-            .map(|c| self.charset.iter().position(|&x| x == c).unwrap_or(0) as DefaultVecType)
+            .map(|c| self.charset.iter().position(|&x| x == c).unwrap_or(0) as DefaultTokenIdType)
             .collect()
     }
 
-    fn decode(&self, tokens: &[DefaultVecType]) -> String {
+    fn decode(&self, tokens: &[DefaultTokenIdType]) -> String {
         tokens
             .iter()
             .map(|&token| self.charset.get(token as usize).cloned().unwrap_or(' '))

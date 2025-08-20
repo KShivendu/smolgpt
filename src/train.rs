@@ -1,12 +1,18 @@
 use crate::{
-    dataset::{self, Dataset, DatasetType},
+    args::Args,
+    dataset::{self, Dataset},
     error::SmolError,
+    model::BigramLM,
     tokenizer::{SimpleTokenizer, Tokenizer},
 };
 use candle_core::{Device, Shape, Tensor};
-use std::path::PathBuf;
 
-pub fn do_training(dataset_path: PathBuf) -> Result<(), SmolError> {
+pub fn do_training(args: Args) -> Result<(), SmolError> {
+    let Args {
+        dataset_path,
+        model_path,
+        epochs,
+    } = args;
     let corpus = dataset::load_corpus(&dataset_path, false);
     let tokenizer = SimpleTokenizer::new(&corpus);
     let device = Device::Cpu;
@@ -22,16 +28,25 @@ pub fn do_training(dataset_path: PathBuf) -> Result<(), SmolError> {
     );
 
     let mut dataset = Dataset::new(data, 0.9)?;
+    // debug_dataset(&mut dataset)?;
 
-    let block_size = 8_usize;
-    let num_batches = 1_usize;
+    let num_batches = 64;
+    let vocab_size = tokenizer.vocab_size();
 
-    let first_block_size = dataset.get_batch(DatasetType::Training, 0, block_size)?;
-    println!("First block of size {}: {:?}", block_size, first_block_size);
+    let mut model = if model_path.exists() {
+        println!("Loading model from {}", model_path.display());
+        BigramLM::load(&model_path, vocab_size, vocab_size, &device)?
+    } else {
+        BigramLM::new(vocab_size, vocab_size, &device)?
+    };
 
-    let (x_batch, y_batch) =
-        dataset.get_random_batches(DatasetType::Training, block_size, num_batches)?;
-    println!("Random batch: X: {:?}, Y: {:?}", x_batch, y_batch);
+    model.train(&mut dataset, epochs, num_batches)?;
+    model.save(&model_path)?;
+
+    let output = model.generate(500, &device)?;
+    let decoded_output = tokenizer.decode(&output);
+
+    println!("Generated text:\n{}", decoded_output);
 
     Ok(())
 }

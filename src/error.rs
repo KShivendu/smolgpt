@@ -7,12 +7,18 @@ pub enum SmolError {
 
     #[error("Dataset error: {0}")]
     DatasetError(String),
-    // #[error("Tokenizer error: {0}")]
-    // TokenizerError(String),
+    #[error("Got error: {0}")]
+    CustomError(String),
 }
 
 impl SmolError {
     pub fn dataset_error(msg: &str) -> Self {
         SmolError::DatasetError(msg.to_string())
     }
+
+    pub fn custom_error(msg: &str) -> Self {
+        SmolError::CustomError(msg.to_string())
+    }
 }
+
+pub type SmolResult<T> = Result<T, SmolError>;
