@@ -13,11 +13,12 @@ smolgpt --epochs 1000 --train --generate
 
 ## Output:
 
-From BigramLM:
+BigramLM saturates around 2.5 cross-entropy loss for [Tiny Shakespeare dataset](https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt)
 
 ```console
 $ smolgpt -e 4000 --train --generate
 
+...
 Epoch 4000/4000: Loss = 2.5262532
 Training completed in 23.88s
 Generated text:
@@ -37,6 +38,8 @@ ICHen nfur herothyo wTringju, besurtly bavermy
 Vad iYVI f my w,
 ThDUEN
 ```
+
+Check out [roadmap](./roadmap.md)
 
 ## Useful links
 

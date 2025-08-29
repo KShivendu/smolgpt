@@ -92,6 +92,9 @@ impl BigramLM {
             let (stacked_x, stacked_y) =
                 dataset.get_random_batches(DatasetType::Training, self.vocab_size, num_batches)?;
             let logits = self.forward(&stacked_x)?;
+            // Batch size -> Number of sequences processed in parallel
+            // Time size -> Number of tokens in each sequence (context length)
+            // Channel size -> The dimension of each token's representation (here vocab size)
             let (batch_size, time_size, channel_size) = logits.shape().dims3()?;
             let loss = loss::cross_entropy(
                 &logits.reshape((batch_size * time_size, channel_size))?,
