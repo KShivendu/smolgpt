@@ -1,8 +1,7 @@
+use crate::error::SmolError;
 use candle_core::{IndexOp, Tensor};
 use rand::Rng;
 use std::path::PathBuf;
-
-use crate::error::SmolError;
 
 pub fn load_corpus(path: &PathBuf, show_sample: bool) -> String {
     let text = std::fs::read_to_string(path).expect("Failed to read dataset file");
@@ -15,6 +14,12 @@ pub fn load_corpus(path: &PathBuf, show_sample: bool) -> String {
     }
 
     text
+}
+
+pub fn load_hf_dataset(dataset_id: &str) {
+    let api = hf_hub::api::sync::Api::new().expect("Failed to create Hugging Face API client");
+    let dataset = candle_datasets::hub::from_hub(&api, dataset_id.to_string())
+        .expect("Failed to load dataset from Hugging Face Hub");
 }
 
 pub struct Dataset {
@@ -125,7 +130,9 @@ mod tests {
         assert_eq!(x_batch.shape(), &Shape::from(4));
         assert_eq!(y_batch.shape(), &Shape::from(4));
 
-        let (x_batch, y_batch) = dataset.get_random_batches(DatasetType::Training, 4, 2).unwrap();
+        let (x_batch, y_batch) = dataset
+            .get_random_batches(DatasetType::Training, 4, 2)
+            .unwrap();
         assert_eq!(x_batch.shape(), &Shape::from_dims(&[2, 4]));
         assert_eq!(y_batch.shape(), &Shape::from(&[2, 4]));
     }
