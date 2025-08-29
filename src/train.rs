@@ -4,7 +4,7 @@ use crate::{
     args::Args,
     dataset::{self, Dataset},
     error::SmolError,
-    model::BigramLM,
+    model::LanguageModel,
     tokenizer::{SimpleTokenizer, Tokenizer},
 };
 use candle_core::{Device, Shape, Tensor};
@@ -43,11 +43,11 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
         ));
     }
 
-    let mut model = if model_path.exists() {
+    let model = if model_path.exists() {
         println!("Loading model from {}", model_path.display());
-        BigramLM::load(&model_path, vocab_size, vocab_size, &device)?
+        LanguageModel::load_gpt(&model_path, vocab_size, 32, &device)?
     } else {
-        BigramLM::new(vocab_size, vocab_size, &device)?
+        LanguageModel::new_gpt(vocab_size, 32, &device)?
     };
 
     if train {
@@ -58,7 +58,8 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
     }
 
     if generate {
-        let output = model.generate(500, &device)?;
+        let rng = &mut rand::rng();
+        let output = model.generate(500, rng, &device)?;
         let decoded_output = tokenizer.decode(&output);
         println!("Generated text: {decoded_output}");
     }
