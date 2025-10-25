@@ -1,14 +1,22 @@
+use clap::{ArgGroup, Parser};
 use std::path::PathBuf;
 
-use clap::{ArgGroup, Parser};
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum, Debug)]
+pub enum ModelType {
+    Gpt,
+    Bigram,
+}
 
 #[derive(Parser, Debug)]
 #[clap(name = "smolgpt", about = "A smol GPT model")]
 #[clap(group(ArgGroup::new("mode").multiple(true).required(true)))]
 pub struct Args {
     /// The path to the model file.
-    #[clap(short, long, default_value = "model.bin")]
+    #[clap(short = 'p', long, default_value = "model.bin")]
     pub model_path: PathBuf,
+
+    #[clap(short = 'm', value_enum, default_value_t = ModelType::Gpt)]
+    pub model_type: ModelType,
 
     /// The path to the dataset file.
     #[clap(short, long, default_value = "data/tinyshakespeare.txt")]

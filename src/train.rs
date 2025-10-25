@@ -16,6 +16,7 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
         epochs,
         train,
         generate,
+        model_type,
     } = args;
     let corpus = dataset::load_corpus(&dataset_path, false);
     let tokenizer = SimpleTokenizer::new(&corpus);
@@ -44,10 +45,10 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
     }
 
     let model = if model_path.exists() {
-        println!("Loading GPT model from {}", model_path.display());
-        LanguageModel::load_gpt(&model_path, vocab_size, 32, &device)?
+        println!("Loading {model_type:?} model from {}", model_path.display());
+        LanguageModel::load(model_type, &model_path, vocab_size, 32, &device)?
     } else {
-        LanguageModel::new_gpt(vocab_size, 32, &device)?
+        LanguageModel::new(model_type, vocab_size, 32, &device)?
     };
 
     if train {

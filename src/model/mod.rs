@@ -2,6 +2,7 @@ mod bigramlm;
 mod gpt;
 
 use crate::{
+    args::ModelType,
     dataset::{Dataset, DatasetType},
     error::{SmolError, SmolResult},
     model::{bigramlm::BigramLM, gpt::Gpt},
@@ -27,6 +28,18 @@ impl LanguageModel {
     pub fn new_gpt(vocab_size: usize, embed_dims: usize, device: &Device) -> SmolResult<Self> {
         let model = Gpt::new(vocab_size, embed_dims, device)?;
         Ok(LanguageModel::Gpt(model))
+    }
+
+    pub fn new(
+        model_type: ModelType,
+        vocab_size: usize,
+        hidden_size: usize,
+        device: &Device,
+    ) -> SmolResult<Self> {
+        match model_type {
+            ModelType::Gpt => Self::new_gpt(vocab_size, hidden_size, device),
+            ModelType::Bigram => Self::new_bigram(vocab_size, hidden_size, device),
+        }
     }
 
     pub fn train(
@@ -106,6 +119,19 @@ impl LanguageModel {
         match self {
             LanguageModel::BigramLM(model) => model.save(path),
             LanguageModel::Gpt(model) => model.save(path),
+        }
+    }
+
+    pub fn load(
+        model_type: ModelType,
+        path: &std::path::PathBuf,
+        vocab_size: usize,
+        hidden_size: usize,
+        device: &Device,
+    ) -> SmolResult<Self> {
+        match model_type {
+            ModelType::Gpt => Self::load_gpt(path, vocab_size, hidden_size, device),
+            ModelType::Bigram => Self::load_bigram(path, vocab_size, hidden_size, device),
         }
     }
 
