@@ -73,12 +73,3 @@ impl Module for Gpt {
         Ok(logits)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_gpt_model() {
-        // Placeholder test to ensure the gpt module is included correctly.
-        assert_eq!(2 + 2, 4);
-    }
-}

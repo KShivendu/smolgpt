@@ -19,7 +19,6 @@ pub enum LanguageModel {
 }
 
 impl LanguageModel {
-    #[expect(dead_code)]
     pub fn new_bigram(vocab_size: usize, hidden_size: usize, device: &Device) -> SmolResult<Self> {
         let model = BigramLM::new(vocab_size, hidden_size, device)?;
         Ok(LanguageModel::BigramLM(model))
@@ -110,7 +109,6 @@ impl LanguageModel {
         }
     }
 
-    #[expect(dead_code)]
     pub fn load_bigram(
         path: &std::path::PathBuf,
         vocab_size: usize,
@@ -163,30 +161,40 @@ pub fn sample_multinomial(rng: &mut ThreadRng, prs: &Vec<f32>) -> SmolResult<u32
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use temp_dir::TempDir;
 
-    #[test]
-    fn test_lm_save_load_preserves_weights() {
+    #[rstest]
+    #[case("bigramlm")]
+    #[case("gpt")]
+    fn test_lm_save_load_preserves_weights(#[case] model_type: &str) {
         let device = Device::Cpu;
         let vocab_size = 100;
         let hidden_size = 64;
-        let model = LanguageModel::new_gpt(vocab_size, hidden_size, &device).unwrap();
+
+        let model = match model_type {
+            "bigramlm" => LanguageModel::new_bigram(vocab_size, hidden_size, &device).unwrap(),
+            "gpt" => LanguageModel::new_gpt(vocab_size, hidden_size, &device).unwrap(),
+            _ => panic!("Unknown model type {model_type}"),
+        };
 
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("model.pt");
         model.save(&path).unwrap();
 
-        let loaded_model =
-            LanguageModel::load_gpt(&path, vocab_size, hidden_size, &device).unwrap();
+        let loaded_model = match model_type {
+            "bigramlm" => {
+                LanguageModel::load_bigram(&path, vocab_size, hidden_size, &device).unwrap()
+            }
+            "gpt" => LanguageModel::load_gpt(&path, vocab_size, hidden_size, &device).unwrap(),
+            _ => panic!("Unknown model type {model_type}"),
+        };
 
         assert_eq!(model.get_vocab_size(), loaded_model.get_vocab_size());
 
         let original_embeddings = model.get_embeddings_vec2d().unwrap();
         let loaded_embeddings = loaded_model.get_embeddings_vec2d().unwrap();
 
-        // Check actual values as well. Tensor doesn't implement PartialEq, so we compare the data.
         assert_eq!(original_embeddings, loaded_embeddings);
-
-        std::fs::remove_file(path).unwrap(); // Clean up
     }
 }
