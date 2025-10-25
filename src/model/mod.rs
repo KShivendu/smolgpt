@@ -7,7 +7,7 @@ use crate::{
     error::{SmolError, SmolResult},
     model::{bigramlm::BigramLM, gpt::Gpt},
 };
-use candle_core::{Device, IndexOp, Shape, Tensor};
+use candle_core::{Device, IndexOp, Tensor};
 use candle_nn::{AdamW, Optimizer, ParamsAdamW, loss, ops::softmax};
 use rand::{
     distr::{Distribution, weighted::WeightedIndex},
@@ -116,13 +116,22 @@ impl LanguageModel {
         let mut generated_ids: Vec<u32> = Vec::with_capacity(max_new_tokens);
         generated_ids.push(0); // Start with a token, e.g., <BOS>
         let model = self.get_model();
-        for i in 1..max_new_tokens {
+        let block_size = self.get_block_size();
+        for _ in 1..max_new_tokens {
+            // Truncate generated_ids to the model's block size
+            let truncated_ids: Vec<u32> = generated_ids
+                .iter()
+                .skip(0.max(generated_ids.len().saturating_sub(block_size)))
+                .cloned()
+                .collect();
+            let truncated_len = truncated_ids.len();
+
             let logits = model.forward(&Tensor::from_vec(
-                generated_ids.clone(),
-                Shape::from(i),
+                truncated_ids,
+                (1, truncated_len),
                 device,
             )?)?;
-            let most_recent_logits = logits.i(i - 1)?;
+            let most_recent_logits = logits.i((0, truncated_len - 1, ..))?;
             let probabilities = softmax(&most_recent_logits, 0)?;
             let vec = probabilities.to_vec1()?;
             let next_token = sample_multinomial(rng, &vec)?;

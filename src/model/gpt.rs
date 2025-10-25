@@ -5,6 +5,7 @@ use crate::error::SmolResult;
 
 pub struct Gpt {
     pub token_embeddings: Embedding,
+    pub position_embeddings: Embedding,
     pub lm_head: Linear,
     pub var_map: VarMap,
     pub block_size: usize,
@@ -21,10 +22,21 @@ impl Gpt {
         let var_builder = VarBuilder::from_varmap(&var_map, DType::F32, device);
 
         // Create the token embedding layer
-        let token_embedding = Embedding::new(
+        let token_embeddings = Embedding::new(
             var_builder.get_with_hints(
                 (vocab_size, embed_dims),
                 "token_embeddings",
+                Init::Randn {
+                    mean: 0.0,
+                    stdev: 1.0,
+                },
+            )?,
+            embed_dims,
+        );
+        let position_embeddings = Embedding::new(
+            var_builder.get_with_hints(
+                (block_size, embed_dims),
+                "position_embeddings",
                 Init::Randn {
                     mean: 0.0,
                     stdev: 1.0,
@@ -36,7 +48,8 @@ impl Gpt {
         let lm_head = linear_b(embed_dims, vocab_size, true, var_builder)?;
 
         Ok(Gpt {
-            token_embeddings: token_embedding,
+            token_embeddings,
+            position_embeddings: position_embeddings,
             lm_head,
             var_map,
             block_size,
@@ -62,11 +75,17 @@ impl Gpt {
             "token_embeddings",
             Init::Const(0.0),
         )?;
+        let position_embeddings = var_builder.get_with_hints(
+            (block_size, embed_dims),
+            "position_embeddings",
+            Init::Const(0.0),
+        )?;
         let lm_head = linear_b(embed_dims, vocab_size, true, var_builder)?;
         var_map.load(path)?;
 
         Ok(Gpt {
             token_embeddings: Embedding::new(token_embeddings, embed_dims),
+            position_embeddings: Embedding::new(position_embeddings, embed_dims),
             lm_head,
             var_map,
             block_size,
@@ -79,8 +98,19 @@ impl Module for Gpt {
         &self,
         input: &candle_core::Tensor, // (batch_size, seq_len)
     ) -> Result<candle_core::Tensor, candle_core::Error> {
+        // (b, t, c) => b = batch_size, t = seq_len, c = embed_dims
+        let (_, t) = input.shape().dims2()?;
+
         let token_embedding = self.token_embeddings.forward(input)?; // (batch_size, seq_len, embed_dims)
-        let logits = self.lm_head.forward(&token_embedding)?; // (batch_size, seq_len, vocab_size)
+
+        let position_embedding = self
+            .position_embeddings
+            .forward(&candle_core::Tensor::arange(0, t as u32, input.device())?)?; // (seq_len, embed_dims)
+
+        let combined_embedding = token_embedding.broadcast_add(&position_embedding)?; // (batch_size, seq_len, embed_dims)
+
+        let logits = self.lm_head.forward(&combined_embedding)?; // (batch_size, seq_len, vocab_size)
+
         Ok(logits)
     }
 }
