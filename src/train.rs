@@ -44,7 +44,7 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
     }
 
     let model = if model_path.exists() {
-        println!("Loading model from {}", model_path.display());
+        println!("Loading GPT model from {}", model_path.display());
         LanguageModel::load_gpt(&model_path, vocab_size, 32, &device)?
     } else {
         LanguageModel::new_gpt(vocab_size, 32, &device)?
