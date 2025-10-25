@@ -22,6 +22,11 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
     let tokenizer = SimpleTokenizer::new(&corpus);
     let device = Device::Cpu;
 
+    let model_path = model_path.unwrap_or_else(|| match model_type {
+        crate::args::ModelType::Gpt => "gpt.bin".into(),
+        crate::args::ModelType::Bigram => "bigram.bin".into(),
+    });
+
     let encoded_corpus = tokenizer.encode(&corpus);
     let encoded_corpus_len = encoded_corpus.len();
     let data = Tensor::from_vec(encoded_corpus, Shape::from(encoded_corpus_len), &device)?;
@@ -36,6 +41,8 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
     // debug_dataset(&mut dataset)?;
 
     let num_batches = 64;
+    let block_size = 32;
+    let hidden_size = 32;
     let vocab_size = tokenizer.vocab_size();
 
     if !args.train && !args.generate {
@@ -46,16 +53,23 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
 
     let model = if model_path.exists() {
         println!("Loading {model_type:?} model from {}", model_path.display());
-        LanguageModel::load(model_type, &model_path, vocab_size, 32, &device)?
+        LanguageModel::load(
+            model_type,
+            &model_path,
+            block_size,
+            vocab_size,
+            hidden_size,
+            &device,
+        )?
     } else {
-        LanguageModel::new(model_type, vocab_size, 32, &device)?
+        println!("Creating new {model_type:?} model");
+        LanguageModel::new(model_type, block_size, vocab_size, hidden_size, &device)?
     };
 
     if train {
         let now = Instant::now();
-        model.train(&mut dataset, epochs, num_batches)?;
+        model.train(&mut dataset, &model_path, epochs, num_batches)?;
         println!("Training completed in {:.2?}", now.elapsed());
-        model.save(&model_path)?;
     }
 
     if generate {

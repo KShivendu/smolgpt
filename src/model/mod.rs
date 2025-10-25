@@ -20,41 +20,48 @@ pub enum LanguageModel {
 }
 
 impl LanguageModel {
-    pub fn new_bigram(vocab_size: usize, hidden_size: usize, device: &Device) -> SmolResult<Self> {
-        let model = BigramLM::new(vocab_size, hidden_size, device)?;
+    pub fn new_bigram(vocab_size: usize, device: &Device) -> SmolResult<Self> {
+        let model = BigramLM::new(vocab_size, device)?;
         Ok(LanguageModel::BigramLM(model))
     }
 
-    pub fn new_gpt(vocab_size: usize, embed_dims: usize, device: &Device) -> SmolResult<Self> {
-        let model = Gpt::new(vocab_size, embed_dims, device)?;
+    pub fn new_gpt(
+        block_size: usize,
+        vocab_size: usize,
+        embed_dims: usize,
+        device: &Device,
+    ) -> SmolResult<Self> {
+        let model = Gpt::new(block_size, vocab_size, embed_dims, device)?;
         Ok(LanguageModel::Gpt(model))
     }
 
     pub fn new(
         model_type: ModelType,
+        block_size: usize,
         vocab_size: usize,
         hidden_size: usize,
         device: &Device,
     ) -> SmolResult<Self> {
         match model_type {
-            ModelType::Gpt => Self::new_gpt(vocab_size, hidden_size, device),
-            ModelType::Bigram => Self::new_bigram(vocab_size, hidden_size, device),
+            ModelType::Gpt => Self::new_gpt(block_size, vocab_size, hidden_size, device),
+            ModelType::Bigram => Self::new_bigram(vocab_size, device),
         }
     }
 
     pub fn train(
         &self,
         dataset: &mut Dataset,
+        model_path: &std::path::PathBuf,
         num_epochs: usize,
         num_batches: usize,
     ) -> SmolResult<()> {
         let model = self.get_model();
-        let vocab_size = self.get_vocab_size();
+        let block_size = self.get_block_size();
         let mut optimizer = AdamW::new(self.get_var_map().all_vars(), ParamsAdamW::default())?;
 
         for epoch in 0..num_epochs {
             let (stacked_x, stacked_y) =
-                dataset.get_random_batches(DatasetType::Training, vocab_size, num_batches)?;
+                dataset.get_random_batches(DatasetType::Training, block_size, num_batches)?;
             let logits = model.forward(&stacked_x)?;
             // Batch size -> Number of sequences processed in parallel
             // Time size -> Number of tokens in each sequence (context length)
@@ -74,7 +81,17 @@ impl LanguageModel {
                 num_epochs,
                 loss.to_scalar::<f32>()?
             );
+
+            // Save every 10 epochs
+            if (epoch + 1) % 10 == 0 {
+                self.save(model_path)?;
+                println!("Model saved at epoch {}", epoch + 1);
+            }
         }
+
+        // Final save after training
+        self.save(model_path)?;
+        println!("Model saved after final epoch");
 
         Ok(())
     }
@@ -84,7 +101,7 @@ impl LanguageModel {
     fn get_embeddings_vec2d(&self) -> SmolResult<Vec<Vec<f32>>> {
         let embedding_table = match self {
             LanguageModel::BigramLM(model) => model.token_embedding.clone(),
-            LanguageModel::Gpt(model) => model.token_embedding.clone(),
+            LanguageModel::Gpt(model) => model.token_embeddings.clone(),
         };
         let flattened = embedding_table.embeddings().to_vec2::<f32>()?;
         Ok(flattened)
@@ -125,33 +142,34 @@ impl LanguageModel {
     pub fn load(
         model_type: ModelType,
         path: &std::path::PathBuf,
+        block_size: usize,
         vocab_size: usize,
         hidden_size: usize,
         device: &Device,
     ) -> SmolResult<Self> {
         match model_type {
-            ModelType::Gpt => Self::load_gpt(path, vocab_size, hidden_size, device),
-            ModelType::Bigram => Self::load_bigram(path, vocab_size, hidden_size, device),
+            ModelType::Gpt => Self::load_gpt(path, block_size, vocab_size, hidden_size, device),
+            ModelType::Bigram => Self::load_bigram(path, vocab_size, device),
         }
     }
 
     pub fn load_bigram(
         path: &std::path::PathBuf,
         vocab_size: usize,
-        hidden_size: usize,
         device: &Device,
     ) -> SmolResult<Self> {
-        let model = BigramLM::load(path, vocab_size, hidden_size, device)?;
+        let model = BigramLM::load(path, vocab_size, device)?;
         Ok(LanguageModel::BigramLM(model))
     }
 
     pub fn load_gpt(
         path: &std::path::PathBuf,
+        block_size: usize,
         vocab_size: usize,
         embed_dims: usize,
         device: &Device,
     ) -> SmolResult<Self> {
-        let model = Gpt::load(path, vocab_size, embed_dims, device)?;
+        let model = Gpt::load(path, block_size, vocab_size, embed_dims, device)?;
         Ok(LanguageModel::Gpt(model))
     }
 
@@ -169,10 +187,10 @@ impl LanguageModel {
         }
     }
 
-    fn get_vocab_size(&self) -> usize {
+    fn get_block_size(&self) -> usize {
         match self {
-            LanguageModel::BigramLM(model) => model.vocab_size,
-            LanguageModel::Gpt(model) => model.vocab_size,
+            LanguageModel::BigramLM(model) => model.vocab_size, // Bigram model does have block size concept
+            LanguageModel::Gpt(model) => model.block_size,
         }
     }
 }
@@ -197,10 +215,11 @@ mod tests {
         let device = Device::Cpu;
         let vocab_size = 100;
         let hidden_size = 64;
+        let block_size = 16;
 
         let model = match model_type {
-            "bigramlm" => LanguageModel::new_bigram(vocab_size, hidden_size, &device).unwrap(),
-            "gpt" => LanguageModel::new_gpt(vocab_size, hidden_size, &device).unwrap(),
+            "bigramlm" => LanguageModel::new_bigram(vocab_size, &device).unwrap(),
+            "gpt" => LanguageModel::new_gpt(block_size, vocab_size, hidden_size, &device).unwrap(),
             _ => panic!("Unknown model type {model_type}"),
         };
 
@@ -209,14 +228,13 @@ mod tests {
         model.save(&path).unwrap();
 
         let loaded_model = match model_type {
-            "bigramlm" => {
-                LanguageModel::load_bigram(&path, vocab_size, hidden_size, &device).unwrap()
-            }
-            "gpt" => LanguageModel::load_gpt(&path, vocab_size, hidden_size, &device).unwrap(),
+            "bigramlm" => LanguageModel::load_bigram(&path, vocab_size, &device).unwrap(),
+            "gpt" => LanguageModel::load_gpt(&path, block_size, vocab_size, hidden_size, &device)
+                .unwrap(),
             _ => panic!("Unknown model type {model_type}"),
         };
 
-        assert_eq!(model.get_vocab_size(), loaded_model.get_vocab_size());
+        assert_eq!(model.get_block_size(), loaded_model.get_block_size());
 
         let original_embeddings = model.get_embeddings_vec2d().unwrap();
         let loaded_embeddings = loaded_model.get_embeddings_vec2d().unwrap();

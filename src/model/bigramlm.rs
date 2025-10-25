@@ -10,11 +10,11 @@ pub struct BigramLM {
 }
 
 impl BigramLM {
-    pub fn new(vocab_size: usize, hidden_size: usize, device: &Device) -> SmolResult<Self> {
+    pub fn new(vocab_size: usize, device: &Device) -> SmolResult<Self> {
         let var_map = VarMap::new();
         let var_builder = VarBuilder::from_varmap(&var_map, DType::F32, device);
         let embeddings = var_builder.get_with_hints(
-            (vocab_size, hidden_size),
+            (vocab_size, vocab_size),
             "embeddings",
             Init::Randn {
                 mean: 0.0,
@@ -22,7 +22,7 @@ impl BigramLM {
             },
         )?;
 
-        let token_embedding = Embedding::new(embeddings, hidden_size);
+        let token_embedding = Embedding::new(embeddings, vocab_size);
 
         Ok(BigramLM {
             token_embedding,
@@ -39,19 +39,18 @@ impl BigramLM {
     pub fn load(
         path: &PathBuf,
         vocab_size: usize,
-        hidden_size: usize,
         device: &Device,
     ) -> SmolResult<Self> {
         let mut var_map = VarMap::new();
         let var_builder = VarBuilder::from_varmap(&var_map, DType::F32, device);
         let embeddings = var_builder.get_with_hints(
-            (vocab_size, hidden_size),
+            (vocab_size, vocab_size),
             "embeddings",
             Init::Const(0.0),
         )?;
         var_map.load(path)?;
 
-        let token_embedding = Embedding::new(embeddings, hidden_size);
+        let token_embedding = Embedding::new(embeddings, vocab_size);
 
         Ok(BigramLM {
             token_embedding,

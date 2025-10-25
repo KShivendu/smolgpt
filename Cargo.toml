@@ -13,3 +13,7 @@ thiserror = "2.0.15"
 [dev-dependencies]
 rstest = "0.26.1"
 temp-dir = "0.1.16"
+
+[profile.dev]
+debug = true
+

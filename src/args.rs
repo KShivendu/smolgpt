@@ -12,8 +12,8 @@ pub enum ModelType {
 #[clap(group(ArgGroup::new("mode").multiple(true).required(true)))]
 pub struct Args {
     /// The path to the model file.
-    #[clap(short = 'p', long, default_value = "model.bin")]
-    pub model_path: PathBuf,
+    #[clap(short = 'p', long)]
+    pub model_path: Option<PathBuf>,
 
     #[clap(short = 'm', value_enum, default_value_t = ModelType::Gpt)]
     pub model_type: ModelType,
