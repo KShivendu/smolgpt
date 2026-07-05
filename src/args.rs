@@ -7,6 +7,14 @@ pub enum ModelType {
     Bigram,
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum, Debug)]
+pub enum TokenizerType {
+    /// One token per character (vocab = distinct chars in the corpus).
+    Char,
+    /// Byte-level Byte-Pair Encoding trained on the corpus.
+    Bpe,
+}
+
 #[derive(Parser, Debug)]
 #[clap(name = "smolgpt", about = "A smol GPT model")]
 #[clap(group(ArgGroup::new("mode").multiple(true).required(true)))]
@@ -17,6 +25,14 @@ pub struct Args {
 
     #[clap(short = 'm', value_enum, default_value_t = ModelType::Gpt)]
     pub model_type: ModelType,
+
+    /// How to tokenize the corpus.
+    #[clap(short = 'k', long, value_enum, default_value_t = TokenizerType::Char)]
+    pub tokenizer: TokenizerType,
+
+    /// Target vocabulary size for the BPE tokenizer (>= 256, ignored for char).
+    #[clap(long, default_value = "1024")]
+    pub vocab_size: usize,
 
     /// The path to the dataset file.
     #[clap(short, long, default_value = "data/tinyshakespeare.txt")]

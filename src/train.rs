@@ -1,11 +1,11 @@
 use std::time::Instant;
 
 use crate::{
-    args::Args,
+    args::{Args, TokenizerType},
     dataset::{self, Dataset},
     error::SmolError,
     model::LanguageModel,
-    tokenizer::{SimpleTokenizer, Tokenizer},
+    tokenizer::{BpeTokenizer, SimpleTokenizer, Tokenizer},
 };
 use candle_core::{Device, Shape, Tensor};
 
@@ -17,14 +17,33 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
         train,
         generate,
         model_type,
+        tokenizer: tokenizer_type,
+        vocab_size: target_vocab_size,
     } = args;
     let corpus = dataset::load_corpus(&dataset_path, false);
-    let tokenizer = SimpleTokenizer::new(&corpus);
     let device = Device::Cpu;
 
-    let model_path = model_path.unwrap_or_else(|| match model_type {
-        crate::args::ModelType::Gpt => "gpt.bin".into(),
-        crate::args::ModelType::Bigram => "bigram.bin".into(),
+    let tokenizer: Box<dyn Tokenizer<u32>> = match tokenizer_type {
+        TokenizerType::Char => Box::new(SimpleTokenizer::new(&corpus)),
+        TokenizerType::Bpe => Box::new(BpeTokenizer::train(&corpus, target_vocab_size)),
+    };
+    println!(
+        "Tokenizer: {:?}, vocab size: {}",
+        tokenizer_type,
+        tokenizer.vocab_size()
+    );
+
+    // Keep char- and BPE-trained models in separate files: their vocabularies
+    // (and therefore embedding tables) are incompatible.
+    let model_path = model_path.unwrap_or_else(|| {
+        let suffix = match tokenizer_type {
+            TokenizerType::Char => "char",
+            TokenizerType::Bpe => "bpe",
+        };
+        match model_type {
+            crate::args::ModelType::Gpt => format!("gpt-{suffix}.bin").into(),
+            crate::args::ModelType::Bigram => format!("bigram-{suffix}.bin").into(),
+        }
     });
 
     let encoded_corpus = tokenizer.encode(&corpus);
