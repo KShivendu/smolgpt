@@ -1,11 +1,11 @@
 use std::time::Instant;
 
 use crate::{
-    args::Args,
+    args::{Args, TokenizerType},
     dataset::{self, Dataset},
     error::SmolError,
-    model::BigramLM,
-    tokenizer::{SimpleTokenizer, Tokenizer},
+    model::LanguageModel,
+    tokenizer::{BpeTokenizer, SimpleTokenizer, Tokenizer},
 };
 use candle_core::{Device, Shape, Tensor};
 
@@ -16,10 +16,35 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
         epochs,
         train,
         generate,
+        model_type,
+        tokenizer: tokenizer_type,
+        vocab_size: target_vocab_size,
     } = args;
     let corpus = dataset::load_corpus(&dataset_path, false);
-    let tokenizer = SimpleTokenizer::new(&corpus);
     let device = Device::Cpu;
+
+    let tokenizer: Box<dyn Tokenizer<u32>> = match tokenizer_type {
+        TokenizerType::Char => Box::new(SimpleTokenizer::new(&corpus)),
+        TokenizerType::Bpe => Box::new(BpeTokenizer::train(&corpus, target_vocab_size)),
+    };
+    println!(
+        "Tokenizer: {:?}, vocab size: {}",
+        tokenizer_type,
+        tokenizer.vocab_size()
+    );
+
+    // Keep char- and BPE-trained models in separate files: their vocabularies
+    // (and therefore embedding tables) are incompatible.
+    let model_path = model_path.unwrap_or_else(|| {
+        let suffix = match tokenizer_type {
+            TokenizerType::Char => "char",
+            TokenizerType::Bpe => "bpe",
+        };
+        match model_type {
+            crate::args::ModelType::Gpt => format!("gpt-{suffix}.bin").into(),
+            crate::args::ModelType::Bigram => format!("bigram-{suffix}.bin").into(),
+        }
+    });
 
     let encoded_corpus = tokenizer.encode(&corpus);
     let encoded_corpus_len = encoded_corpus.len();
@@ -35,6 +60,8 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
     // debug_dataset(&mut dataset)?;
 
     let num_batches = 64;
+    let block_size = 32;
+    let hidden_size = 32;
     let vocab_size = tokenizer.vocab_size();
 
     if !args.train && !args.generate {
@@ -43,22 +70,30 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
         ));
     }
 
-    let mut model = if model_path.exists() {
-        println!("Loading model from {}", model_path.display());
-        BigramLM::load(&model_path, vocab_size, vocab_size, &device)?
+    let model = if model_path.exists() {
+        println!("Loading {model_type:?} model from {}", model_path.display());
+        LanguageModel::load(
+            model_type,
+            &model_path,
+            block_size,
+            vocab_size,
+            hidden_size,
+            &device,
+        )?
     } else {
-        BigramLM::new(vocab_size, vocab_size, &device)?
+        println!("Creating new {model_type:?} model");
+        LanguageModel::new(model_type, block_size, vocab_size, hidden_size, &device)?
     };
 
     if train {
         let now = Instant::now();
-        model.train(&mut dataset, epochs, num_batches)?;
+        model.train(&mut dataset, &model_path, epochs, num_batches)?;
         println!("Training completed in {:.2?}", now.elapsed());
-        model.save(&model_path)?;
     }
 
     if generate {
-        let output = model.generate(500, &device)?;
+        let rng = &mut rand::rng();
+        let output = model.generate(500, rng, &device)?;
         let decoded_output = tokenizer.decode(&output);
         println!("Generated text: {decoded_output}");
     }
