@@ -25,7 +25,24 @@ impl SimpleTokenizer {
 impl Tokenizer<DefaultTokenIdType> for SimpleTokenizer {
     fn encode(&self, text: &str) -> Vec<DefaultTokenIdType> {
         text.chars()
-            .map(|c| self.charset.iter().position(|&x| x == c).unwrap_or(0) as DefaultTokenIdType)
+            .map(|c| match self.charset.iter().position(|&x| x == c) {
+                Some(p) => p as DefaultTokenIdType,
+                None => {
+                    // Falling back to token 0 (rather than adding a dedicated
+                    // UNK id) keeps `vocab_size` unchanged so already-saved
+                    // checkpoints (whose embedding table was sized off the
+                    // training-time charset) still load. But token 0 is a
+                    // real, arbitrary character in that charset, so silently
+                    // substituting it would corrupt the input without any
+                    // sign something went wrong — surface it loudly instead.
+                    eprintln!(
+                        "warning: SimpleTokenizer::encode: char {c:?} not in trained charset, \
+                         substituting token 0 ({:?})",
+                        self.charset.first()
+                    );
+                    0
+                }
+            })
             .collect()
     }
 

@@ -2,8 +2,9 @@
 //!
 //! Prompts a trained `LanguageModel` with `a op b=` (op in {+, -}) and checks
 //! whether its greedy (argmax) completion matches the true arithmetic answer.
-//! Reports overall accuracy, breakdown by operator, and breakdown by operand
-//! digit-length so failure modes are easy to spot.
+//! Reports overall accuracy, breakdown by operator, and breakdown by the
+//! number of digits in the TRUE ANSWER so in-distribution vs OOD failure modes
+//! are easy to spot.
 
 use candle_core::Device;
 use rand::{
@@ -19,14 +20,19 @@ use crate::{
 
 /// Aggregate accuracy report for an eval run.
 ///
-/// `by_digits` buckets samples by `max(a.abs().to_string().len(),
-/// b.abs().to_string().len())`:
-///   - index 0 -> 1-digit operands
-///   - index 1 -> 2-digit operands
-///   - index 2 -> 3-digit operands
-///   - index 3 -> 4-or-more-digit operands
+/// `by_digits` buckets samples by the number of digits in the TRUE ANSWER
+/// (`c = a op b`), measured as `c.abs().to_string().len()` (the `-` sign of a
+/// negative answer is NOT counted as a digit):
+///   - index 0 -> 1-digit answer (e.g. `7`, `-3`)
+///   - index 1 -> 2-digit answer (e.g. `18`, `-42`)
+///   - index 2 -> 3-digit answer (e.g. `123`, `-999`)
+///   - index 3 -> 4-or-more-digit answer
 ///
-/// Each bucket holds `(correct, total)`.
+/// Each bucket holds `(correct, total)`. For a single-digit-addition model
+/// trained on `a+b ≤ 9` (answers 0–18), the 1-digit-answer bucket is
+/// in-distribution and the 2-digit-answer bucket is OOD — this split
+/// immediately surfaces why a ~45% eval is ~90% on 1-digit answers and ~0%
+/// on 2-digit answers.
 ///
 /// `examples` holds up to 10 worked samples so HTTP/JSON consumers (the
 /// `--serve` web UI) can render failure modes without scraping stdout.
@@ -66,6 +72,47 @@ pub struct EvalExample {
 /// `StdRng` so the eval is fully reproducible (greedy decoding is deterministic,
 /// so two runs with the same seed produce identical output). If `seed` is
 /// `None`, OS entropy is used.
+/// Parse a comma-separated ops string (e.g. `+` or `+,-`) into validated chars.
+/// Used by `run_eval` and `run_rft` to restrict which operators are generated.
+pub fn parse_ops(ops: &str) -> SmolResult<Vec<char>> {
+    let mut out = Vec::new();
+    for raw in ops.split(',') {
+        match raw.trim() {
+            "+" => out.push('+'),
+            "-" => out.push('-'),
+            other => {
+                return Err(SmolError::invalid_argument(&format!(
+                    "ops entry `{other}` invalid; only `+` and `-` supported"
+                )))
+            }
+        }
+    }
+    if out.is_empty() {
+        return Err(SmolError::invalid_argument("ops must contain at least one operator"));
+    }
+    Ok(out)
+}
+
+/// Map a true arithmetic answer to a `by_digits` bucket index by counting the
+/// digits in its absolute value:
+///   - 1-digit answer  (`0..=9`, `-9..=-1`)  -> 0
+///   - 2-digit answer  (`10..=99`, `-99..=-10`) -> 1
+///   - 3-digit answer  (`100..=999`, `-999..=-100`) -> 2
+///   - 4+-digit answer                          -> 3
+///
+/// The `-` sign of a negative answer is NOT counted as a digit, so `-42` is a
+/// 2-digit answer. Extracted as a pure helper so the bucketing rule is
+/// unit-testable without spinning up a model.
+pub fn answer_digit_bucket(answer: i64) -> usize {
+    let len = answer.abs().to_string().len();
+    match len {
+        1 => 0,
+        2 => 1,
+        3 => 2,
+        _ => 3,
+    }
+}
+
 pub fn run_eval(
     model: &LanguageModel,
     tokenizer: &dyn Tokenizer<u32>,
@@ -75,6 +122,7 @@ pub fn run_eval(
     max: i64,
     block_size: usize,
     seed: Option<u64>,
+    ops: &str,
 ) -> SmolResult<EvalReport> {
     if min > max {
         return Err(SmolError::invalid_argument(&format!(
@@ -98,10 +146,11 @@ pub fn run_eval(
 
     let mut report = EvalReport::default();
 
+    let ops_list: Vec<char> = parse_ops(ops)?;
     for _ in 0..n_samples {
         let a: i64 = rng.random_range(min..=max);
         let b: i64 = rng.random_range(min..=max);
-        let op: char = if rng.random_bool(0.5) { '+' } else { '-' };
+        let op: char = ops_list[rng.random_range(0..ops_list.len())];
         let true_answer: i64 = if op == '+' { a + b } else { a - b };
 
         let prompt = format!("{a}{op}{b}=");
@@ -134,13 +183,12 @@ pub fn run_eval(
             }
         }
 
-        let digit_len = std::cmp::max(a.abs().to_string().len(), b.abs().to_string().len());
-        let bucket = match digit_len {
-            1 => 0,
-            2 => 1,
-            3 => 2,
-            _ => 3,
-        };
+        // Bucket by the number of digits in the TRUE ANSWER (`c = a op b`).
+        // The `-` sign of a negative answer is NOT a digit, so we take
+        // `abs().to_string().len()`. For a single-digit-addition model this
+        // separates in-distribution (1-digit answer) from OOD (2-digit answer),
+        // which the old operand-digit bucketing couldn't surface.
+        let bucket = answer_digit_bucket(true_answer);
         report.by_digits[bucket].1 += 1;
         if correct {
             report.by_digits[bucket].0 += 1;
@@ -175,19 +223,19 @@ fn print_report(report: &EvalReport, examples: &[EvalExample]) {
     println!("  + : {}/{}", report.correct_plus, report.total_plus);
     println!("  - : {}/{}", report.correct_minus, report.total_minus);
     println!(
-        "  1-digit : {}/{}",
+        "  1-digit answer : {}/{}",
         report.by_digits[0].0, report.by_digits[0].1
     );
     println!(
-        "  2-digit : {}/{}",
+        "  2-digit answer : {}/{}",
         report.by_digits[1].0, report.by_digits[1].1
     );
     println!(
-        "  3-digit : {}/{}",
+        "  3-digit answer : {}/{}",
         report.by_digits[2].0, report.by_digits[2].1
     );
     println!(
-        "  4+ digit: {}/{}",
+        "  4+-digit answer: {}/{}",
         report.by_digits[3].0, report.by_digits[3].1
     );
 
@@ -271,5 +319,57 @@ mod tests {
         assert_eq!(parse_leading_int(""), None);
         assert_eq!(parse_leading_int("-"), None);
         assert_eq!(parse_leading_int("\n123"), None);
+    }
+
+    #[test]
+    fn test_answer_digit_bucket_single_digit() {
+        // 1-digit answers (abs 0..=9) → bucket 0. Negative sign is NOT a digit.
+        assert_eq!(answer_digit_bucket(0), 0);
+        assert_eq!(answer_digit_bucket(7), 0);
+        assert_eq!(answer_digit_bucket(9), 0);
+        assert_eq!(answer_digit_bucket(-1), 0);
+        assert_eq!(answer_digit_bucket(-9), 0);
+    }
+
+    #[test]
+    fn test_answer_digit_bucket_two_digit() {
+        // 2-digit answers (abs 10..=99) → bucket 1.
+        assert_eq!(answer_digit_bucket(10), 1);
+        assert_eq!(answer_digit_bucket(18), 1);
+        assert_eq!(answer_digit_bucket(99), 1);
+        assert_eq!(answer_digit_bucket(-42), 1);
+        assert_eq!(answer_digit_bucket(-99), 1);
+    }
+
+    #[test]
+    fn test_answer_digit_bucket_three_and_four_plus() {
+        // 3-digit answers (abs 100..=999) → bucket 2.
+        assert_eq!(answer_digit_bucket(100), 2);
+        assert_eq!(answer_digit_bucket(999), 2);
+        assert_eq!(answer_digit_bucket(-999), 2);
+        // 4+-digit answers → bucket 3.
+        assert_eq!(answer_digit_bucket(1000), 3);
+        assert_eq!(answer_digit_bucket(-1250), 3);
+        assert_eq!(answer_digit_bucket(i64::MAX), 3);
+    }
+
+    #[test]
+    fn test_answer_digit_bucket_single_digit_model_split() {
+        // For a single-digit-addition model (operands 0..=9, ops +,-), the
+        // true answers span -9..=18. The 1-digit-answer bucket (0..=9, -9..=-1)
+        // is in-distribution; the 2-digit-answer bucket (10..=18) is OOD. This
+        // is the split the old operand-digit bucketing couldn't surface.
+        let answers: Vec<i64> = (-9..=18).collect();
+        let mut buckets = [0usize; 4];
+        for a in &answers {
+            buckets[answer_digit_bucket(*a)] += 1;
+        }
+        // -9..=-1 (9) + 0..=9 (10) = 19 → bucket 0.
+        assert_eq!(buckets[0], 19, "1-digit-answer bucket should hold 19 of 28");
+        // 10..=18 (9) → bucket 1.
+        assert_eq!(buckets[1], 9, "2-digit-answer bucket should hold 9 of 28");
+        // No 3-digit or 4+-digit answers in this range.
+        assert_eq!(buckets[2], 0);
+        assert_eq!(buckets[3], 0);
     }
 }

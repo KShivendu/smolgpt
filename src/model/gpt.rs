@@ -18,6 +18,14 @@ pub struct Gpt {
     pub lm_head: Linear,
     pub var_map: VarMap,
     pub block_size: usize,
+    /// Stored so `LanguageModel::snapshot` can re-load a frozen reference
+    /// copy with the same arch without the caller having to thread the
+    /// constructor params back through. Not serialized into the `.bin`
+    /// (only `var_map` is); reconstructed from the constructor args on load.
+    pub vocab_size: usize,
+    pub embed_dims: usize,
+    pub num_heads: usize,
+    pub num_blocks: usize,
 }
 
 impl Gpt {
@@ -78,6 +86,10 @@ impl Gpt {
             lm_head,
             var_map,
             block_size,
+            vocab_size,
+            embed_dims,
+            num_heads,
+            num_blocks,
         })
     }
 
@@ -142,6 +154,10 @@ impl Gpt {
             lm_head,
             var_map,
             block_size,
+            vocab_size,
+            embed_dims,
+            num_heads,
+            num_blocks,
         })
     }
 
@@ -160,6 +176,14 @@ impl Gpt {
     ) -> Result<Tensor, CandleError> {
         // (b, t, c) => b = batch_size, t = seq_len, c = embed_dims
         let (_, t) = input.shape().dims2()?;
+        if t > self.block_size {
+            candle_core::bail!(
+                "Gpt::forward_with_training: input seq_len {t} exceeds block_size {} \
+                 (the position-embedding table only has {} rows); truncate the input first",
+                self.block_size,
+                self.block_size
+            );
+        }
 
         let token_embedding = self.token_embeddings.forward(input)?; // (batch_size, seq_len, embed_dims)
 

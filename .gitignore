@@ -4,3 +4,8 @@ model.bin
 data/arithmetic*.txt
 # Cached eval results written by the --serve web UI; regenerable via /api/models/{id}/eval.
 *.eval.json
+# SQLite-backed model registry (regenerable from --train runs + models.toml seed).
+smolgpt.db
+smolgpt.db-wal
+smolgpt.db-shm
+*.bak
