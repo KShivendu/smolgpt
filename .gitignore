@@ -1,3 +1,6 @@
 /target
 model.bin
 *.bin
+data/arithmetic*.txt
+# Cached eval results written by the --serve web UI; regenerable via /api/models/{id}/eval.
+*.eval.json

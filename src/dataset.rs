@@ -1,5 +1,5 @@
 use candle_core::{IndexOp, Tensor};
-use rand::Rng;
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::path::PathBuf;
 
 use crate::error::SmolError;
@@ -22,7 +22,7 @@ pub struct Dataset {
     pub train_size: usize,
     pub validation_data: Tensor,
     pub validation_size: usize,
-    pub rng: rand::rngs::ThreadRng,
+    pub rng: StdRng,
 }
 
 #[derive(Clone)]
@@ -33,7 +33,13 @@ pub enum DatasetType {
 }
 
 impl Dataset {
+    #[allow(dead_code)]
     pub fn new(data: Tensor, train_ratio: f64) -> Result<Self, SmolError> {
+        Self::with_rng(data, train_ratio, StdRng::from_os_rng())
+    }
+
+    /// Build a `Dataset` with a specific RNG (e.g. seeded for reproducibility).
+    pub fn with_rng(data: Tensor, train_ratio: f64, rng: StdRng) -> Result<Self, SmolError> {
         let data_size = *data.shape().dims().first().unwrap();
 
         let train_size = (data_size as f64 * train_ratio) as usize;
@@ -45,7 +51,7 @@ impl Dataset {
             train_size,
             validation_data,
             validation_size: data_size - train_size,
-            rng: rand::rng(),
+            rng,
         })
     }
 

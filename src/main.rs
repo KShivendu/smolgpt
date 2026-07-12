@@ -1,8 +1,11 @@
 mod args;
 mod dataset;
 mod debugging;
+mod eval;
 mod error;
 mod model;
+mod rft;
+mod serve;
 mod tokenizer;
 mod train;
 

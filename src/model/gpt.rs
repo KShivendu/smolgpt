@@ -3,20 +3,18 @@ use core::f32;
 use candle_core::{DType, Device, Error as CandleError, IndexOp, Tensor, D};
 use candle_nn::{
     layer_norm, linear, linear_b, linear_no_bias,
-    ops::{dropout, softmax},
-    sequential, Embedding, Init, LayerNorm, Linear, Module, Sequential, VarBuilder, VarMap,
+    ops::{Dropout, softmax},
+    Embedding, Init, LayerNorm, Linear, Module, VarBuilder, VarMap,
 };
 
-use crate::error::SmolResult;
+use crate::error::{SmolError, SmolResult};
 
-const NUM_HEADS: usize = 8;
-const NUM_BLOCKS: usize = 6;
 const DROPOUT: f32 = 0.1;
 
 pub struct Gpt {
     pub token_embeddings: Embedding,
     pub position_embeddings: Embedding,
-    pub transformer_blocks: Sequential, // Holds TransformerBlock modules
+    transformer_blocks: Vec<TransformerBlock>, // Holds TransformerBlock modules
     pub lm_head: Linear,
     pub var_map: VarMap,
     pub block_size: usize,
@@ -27,8 +25,15 @@ impl Gpt {
         block_size: usize,
         vocab_size: usize,
         embed_dims: usize,
+        num_heads: usize,
+        num_blocks: usize,
         device: &Device,
     ) -> SmolResult<Self> {
+        if embed_dims % num_heads != 0 {
+            return Err(SmolError::invalid_argument(&format!(
+                "hidden_size ({embed_dims}) must be divisible by num_heads ({num_heads})"
+            )));
+        }
         let var_map = VarMap::new();
         let var_builder = VarBuilder::from_varmap(&var_map, DType::F32, device);
 
@@ -55,7 +60,14 @@ impl Gpt {
             )?,
             embed_dims,
         );
-        let transformer_blocks = build_blocks(embed_dims, block_size, &var_builder, device)?;
+        let transformer_blocks = build_blocks(
+            embed_dims,
+            block_size,
+            num_heads,
+            num_blocks,
+            &var_builder,
+            device,
+        )?;
         // Convert embedding dimension back to vocabulary size
         let lm_head = linear_b(embed_dims, vocab_size, true, var_builder.pp("lm_head"))?;
 
@@ -79,8 +91,15 @@ impl Gpt {
         block_size: usize,
         vocab_size: usize,
         embed_dims: usize,
+        num_heads: usize,
+        num_blocks: usize,
         device: &Device,
     ) -> SmolResult<Self> {
+        if embed_dims % num_heads != 0 {
+            return Err(SmolError::invalid_argument(&format!(
+                "hidden_size ({embed_dims}) must be divisible by num_heads ({num_heads})"
+            )));
+        }
         let mut var_map = VarMap::new();
         let var_builder = VarBuilder::from_varmap(&var_map, DType::F32, device);
         // Build the exact same structure as `new` so the variable names/shapes
@@ -96,9 +115,25 @@ impl Gpt {
             "position_embeddings",
             Init::Const(0.0),
         )?;
-        let transformer_blocks = build_blocks(embed_dims, block_size, &var_builder, device)?;
+        let transformer_blocks = build_blocks(
+            embed_dims,
+            block_size,
+            num_heads,
+            num_blocks,
+            &var_builder,
+            device,
+        )?;
         let lm_head = linear_b(embed_dims, vocab_size, true, var_builder.pp("lm_head"))?;
-        var_map.load(path)?;
+        if let Err(underlying) = var_map.load(path) {
+            return Err(SmolError::invalid_argument(&format!(
+                "Model file {} does not match the requested architecture \
+                 (block_size={block_size}, hidden_size={embed_dims}, \
+                 num_heads={num_heads}, num_blocks={num_blocks}). \
+                 Re-run with --block-size/--hidden-size/--num-heads/--num-blocks \
+                 matching the saved model. Underlying error: {underlying}",
+                path.display()
+            )));
+        }
 
         Ok(Gpt {
             token_embeddings: Embedding::new(token_embeddings, embed_dims),
@@ -109,12 +144,19 @@ impl Gpt {
             block_size,
         })
     }
-}
 
-impl Module for Gpt {
-    fn forward(
+    /// Forward pass with an explicit `is_training` flag. When `is_training`
+    /// is `false`, all `Dropout` layers are no-ops, which makes inference
+    /// deterministic given the same inputs and weights. The `Module::forward`
+    /// impl below delegates to this with `is_training = false` so that the
+    /// `&dyn Module` callers (e.g. `LanguageModel::generate`) get the
+    /// inference/deterministic behaviour, while `LanguageModel::train` calls
+    /// this directly with `is_training = true` to keep dropout active during
+    /// training.
+    pub fn forward_with_training(
         &self,
         input: &Tensor, // (batch_size, seq_len)
+        is_training: bool,
     ) -> Result<Tensor, CandleError> {
         // (b, t, c) => b = batch_size, t = seq_len, c = embed_dims
         let (_, t) = input.shape().dims2()?;
@@ -127,11 +169,24 @@ impl Module for Gpt {
 
         let combined_embedding = token_embedding.broadcast_add(&position_embedding)?; // (batch_size, seq_len, embed_dims)
 
-        let x_blocks = self.transformer_blocks.forward(&combined_embedding)?; // (batch_size, seq_len, embed_dims)
+        let mut x_blocks = combined_embedding; // (batch_size, seq_len, embed_dims)
+        for block in &self.transformer_blocks {
+            x_blocks = block.forward_with_training(&x_blocks, is_training)?;
+        }
 
         let logits = self.lm_head.forward(&x_blocks)?; // (batch_size, seq_len, vocab_size)
 
         Ok(logits)
+    }
+}
+
+impl Module for Gpt {
+    fn forward(
+        &self,
+        input: &Tensor, // (batch_size, seq_len)
+    ) -> Result<Tensor, CandleError> {
+        // Default to inference mode so generation is deterministic.
+        self.forward_with_training(input, false)
     }
 }
 
@@ -140,19 +195,22 @@ impl Module for Gpt {
 fn build_blocks(
     embed_dims: usize,
     block_size: usize,
+    num_heads: usize,
+    num_blocks: usize,
     vb: &VarBuilder,
     device: &Device,
-) -> Result<Sequential, CandleError> {
-    let mut blocks = sequential::seq();
+) -> Result<Vec<TransformerBlock>, CandleError> {
     let blocks_vb = vb.pp("blocks");
-    for block_idx in 0..NUM_BLOCKS {
+    let mut blocks = Vec::with_capacity(num_blocks);
+    for block_idx in 0..num_blocks {
         let block = TransformerBlock::new(
             embed_dims,
             block_size,
+            num_heads,
             blocks_vb.pp(format!("block_{block_idx}")),
             device,
         )?;
-        blocks = blocks.add(block);
+        blocks.push(block);
     }
     Ok(blocks)
 }
@@ -168,12 +226,13 @@ impl TransformerBlock {
     pub fn new(
         embed_dims: usize,
         block_size: usize,
+        num_heads: usize,
         vb: VarBuilder,
         device: &Device,
     ) -> Result<Self, CandleError> {
-        let head_size = embed_dims / NUM_HEADS;
+        let head_size = embed_dims / num_heads;
         let multi_head_attn =
-            MultiHeadAttention::new(embed_dims, head_size, block_size, vb.pp("attn"), device)?;
+            MultiHeadAttention::new(embed_dims, head_size, block_size, num_heads, vb.pp("attn"), device)?;
         let feed_forward = FeedForward::new(embed_dims, vb.pp("ffwd"))?;
         let layer_norm1 = layer_norm(embed_dims, 1e-5, vb.pp("ln1"))?;
         let layer_norm2 = layer_norm(embed_dims, 1e-5, vb.pp("ln2"))?;
@@ -185,6 +244,21 @@ impl TransformerBlock {
             layer_norm2,
         })
     }
+
+    pub fn forward_with_training(
+        &self,
+        input: &Tensor, // (batch_size, seq_len, embed_dims)
+        is_training: bool,
+    ) -> Result<Tensor, CandleError> {
+        // Pre-norm residual connections (nanoGPT style).
+        let ln1 = self.layer_norm1.forward(input)?; // (batch_size, seq_len, embed_dims)
+        let self_attn = self.multi_head_attn.forward_with_training(&ln1, is_training)?; // (batch_size, seq_len, embed_dims)
+        let attn_output = input.broadcast_add(&self_attn)?; // (batch_size, seq_len, embed_dims)
+        let ln2 = self.layer_norm2.forward(&attn_output)?; // (batch_size, seq_len, embed_dims)
+        let ff_output = self.feed_forward.forward_with_training(&ln2, is_training)?; // (batch_size, seq_len, embed_dims)
+        let output = attn_output.broadcast_add(&ff_output)?; // (batch_size, seq_len, embed_dims)
+        Ok(output)
+    }
 }
 
 impl Module for TransformerBlock {
@@ -192,21 +266,14 @@ impl Module for TransformerBlock {
         &self,
         input: &Tensor, // (batch_size, seq_len, embed_dims)
     ) -> Result<Tensor, CandleError> {
-        // Pre-norm residual connections (nanoGPT style).
-        let ln1 = self.layer_norm1.forward(input)?; // (batch_size, seq_len, embed_dims)
-        let self_attn = self.multi_head_attn.forward(&ln1)?; // (batch_size, seq_len, embed_dims)
-        let attn_output = input.broadcast_add(&self_attn)?; // (batch_size, seq_len, embed_dims)
-        let ln2 = self.layer_norm2.forward(&attn_output)?; // (batch_size, seq_len, embed_dims)
-        let ff_output = self.feed_forward.forward(&ln2)?; // (batch_size, seq_len, embed_dims)
-        let output = attn_output.broadcast_add(&ff_output)?; // (batch_size, seq_len, embed_dims)
-        Ok(output)
+        self.forward_with_training(input, false)
     }
 }
 
 struct MultiHeadAttention {
     heads: Vec<Head>,
     proj: Linear,
-    dropout_rate: f32,
+    dropout: Dropout,
 }
 
 impl MultiHeadAttention {
@@ -214,11 +281,12 @@ impl MultiHeadAttention {
         embed_dims: usize,
         head_size: usize,
         block_size: usize,
+        num_heads: usize,
         vb: VarBuilder,
         device: &Device,
     ) -> Result<Self, CandleError> {
-        let mut heads = Vec::with_capacity(NUM_HEADS);
-        for head_idx in 0..NUM_HEADS {
+        let mut heads = Vec::with_capacity(num_heads);
+        for head_idx in 0..num_heads {
             heads.push(Head::new(
                 embed_dims,
                 head_size,
@@ -229,13 +297,29 @@ impl MultiHeadAttention {
             )?);
         }
         // Project the concatenated heads back to the embedding dimension.
-        let proj = linear(NUM_HEADS * head_size, embed_dims, vb.pp("proj"))?;
+        let proj = linear(num_heads * head_size, embed_dims, vb.pp("proj"))?;
 
         Ok(MultiHeadAttention {
             heads,
             proj,
-            dropout_rate: DROPOUT,
+            dropout: Dropout::new(DROPOUT),
         })
+    }
+
+    pub fn forward_with_training(
+        &self,
+        input: &Tensor, // (batch_size, seq_len, embed_dims)
+        is_training: bool,
+    ) -> Result<Tensor, CandleError> {
+        let head_outputs = self
+            .heads
+            .iter()
+            .map(|head| head.forward_with_training(input, is_training))
+            .collect::<Result<Vec<_>, _>>()?;
+        // Concatenate along the channel dim: (batch_size, seq_len, num_heads * head_size)
+        let concatenated = Tensor::cat(&head_outputs, 2)?;
+        let projected = self.proj.forward(&concatenated)?; // (batch_size, seq_len, embed_dims)
+        self.dropout.forward(&projected, is_training)
     }
 }
 
@@ -244,22 +328,14 @@ impl Module for MultiHeadAttention {
         &self,
         input: &Tensor, // (batch_size, seq_len, embed_dims)
     ) -> Result<Tensor, CandleError> {
-        let head_outputs = self
-            .heads
-            .iter()
-            .map(|head| head.forward(input))
-            .collect::<Result<Vec<_>, _>>()?;
-        // Concatenate along the channel dim: (batch_size, seq_len, num_heads * head_size)
-        let concatenated = Tensor::cat(&head_outputs, 2)?;
-        let projected = self.proj.forward(&concatenated)?; // (batch_size, seq_len, embed_dims)
-        dropout(&projected, self.dropout_rate)
+        self.forward_with_training(input, false)
     }
 }
 
 struct FeedForward {
     fc1: Linear,
     fc2: Linear,
-    dropout_rate: f32,
+    dropout: Dropout,
 }
 
 impl FeedForward {
@@ -270,16 +346,24 @@ impl FeedForward {
         Ok(FeedForward {
             fc1,
             fc2,
-            dropout_rate: DROPOUT,
+            dropout: Dropout::new(DROPOUT),
         })
+    }
+
+    pub fn forward_with_training(
+        &self,
+        input: &Tensor,
+        is_training: bool,
+    ) -> Result<Tensor, CandleError> {
+        let hidden = self.fc1.forward(input)?.relu()?;
+        let out = self.fc2.forward(&hidden)?;
+        self.dropout.forward(&out, is_training)
     }
 }
 
 impl Module for FeedForward {
     fn forward(&self, input: &Tensor) -> Result<Tensor, CandleError> {
-        let hidden = self.fc1.forward(input)?.relu()?;
-        let out = self.fc2.forward(&hidden)?;
-        dropout(&out, self.dropout_rate)
+        self.forward_with_training(input, false)
     }
 }
 
@@ -290,7 +374,7 @@ struct Head {
     value: Linear,
     tril: Tensor,
     neg_inf: Tensor,
-    dropout_rate: f32,
+    dropout: Dropout,
 }
 
 impl Head {
@@ -315,13 +399,15 @@ impl Head {
             value,
             tril,
             neg_inf,
-            dropout_rate,
+            dropout: Dropout::new(dropout_rate),
         })
     }
-}
 
-impl Module for Head {
-    fn forward(&self, input: &Tensor) -> Result<Tensor, CandleError> {
+    pub fn forward_with_training(
+        &self,
+        input: &Tensor,
+        is_training: bool,
+    ) -> Result<Tensor, CandleError> {
         let k = self.key.forward(input)?; // (batch_size, seq_len, head_size)
         let q = self.query.forward(input)?; // (batch_size, seq_len, head_size)
 
@@ -340,13 +426,19 @@ impl Module for Head {
                 &self.neg_inf.broadcast_as((batch_size, time_size, time_size))?,
             )?; // (B, T, T)
         weights = softmax(&weights, D::Minus1)?; // (B, T, T)
-        weights = dropout(&weights, self.dropout_rate)?;
+        weights = self.dropout.forward(&weights, is_training)?;
 
         // Weighted aggregation of the values.
         let v = self.value.forward(input)?; // (B, T, C)
         let out = weights.matmul(&v)?; // (B, T, T) @ (B, T, C) -> (B, T, C)
 
         Ok(out)
+    }
+}
+
+impl Module for Head {
+    fn forward(&self, input: &Tensor) -> Result<Tensor, CandleError> {
+        self.forward_with_training(input, false)
     }
 }
 
@@ -369,7 +461,7 @@ mod tests {
     fn test_gpt_forward_shape() {
         let device = Device::Cpu;
         let (block_size, vocab_size, embed_dims) = (8, 40, 32);
-        let gpt = Gpt::new(block_size, vocab_size, embed_dims, &device).unwrap();
+        let gpt = Gpt::new(block_size, vocab_size, embed_dims, 8, 6, &device).unwrap();
         // (batch_size=2, seq_len=8)
         let input = Tensor::zeros((2, block_size), DType::U32, &device).unwrap();
         let logits = gpt.forward(&input).unwrap();
