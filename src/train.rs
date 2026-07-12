@@ -92,6 +92,7 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
     }
 
     if generate {
+        println!("Generating from {model_type:?} model ({})", model_path.display());
         let rng = &mut rand::rng();
         let output = model.generate(500, rng, &device)?;
         let decoded_output = tokenizer.decode(&output);

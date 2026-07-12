@@ -27,7 +27,7 @@ pub struct Args {
     pub model_type: ModelType,
 
     /// How to tokenize the corpus.
-    #[clap(short = 'k', long, value_enum, default_value_t = TokenizerType::Char)]
+    #[clap(short = 'k', long, value_enum, default_value_t = TokenizerType::Bpe)]
     pub tokenizer: TokenizerType,
 
     /// Target vocabulary size for the BPE tokenizer (>= 256, ignored for char).
