@@ -5,6 +5,10 @@ use std::path::PathBuf;
 pub enum ModelType {
     Gpt,
     Bigram,
+    /// N-gram model (see `model::ngram::NgramLM`): a faithful generalization
+    /// of `Bigram` that conditions on the previous `--ngram-order - 1`
+    /// tokens instead of just 1. `--ngram-order 2` is bigram-equivalent.
+    Ngram,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum, Debug)]
@@ -83,6 +87,114 @@ pub struct Args {
     /// stop sooner. Ignored when `--patience 0`.
     #[clap(long, default_value_t = 0.001)]
     pub min_delta: f32,
+
+    /// Disable dropout for `--train` (regular SFT). Dropout regularizes
+    /// against overfitting a large/diverse corpus, but for a small,
+    /// fully-memorizable one (e.g. a few dozen arithmetic facts) it caps how
+    /// low the training loss can go and prevents the model from reaching the
+    /// confident weights needed to get every training example right — pass
+    /// this when you actually want the model to memorize its training set.
+    /// Off by default so existing behavior (dropout on) is unchanged.
+    #[clap(long, default_value = "false")]
+    pub no_dropout: bool,
+
+    /// EXPERIMENTAL: fixed AdamW learning rate for `--train`'s SFT loop, used
+    /// to test whether candle's default (0.001, fixed for the whole run) is
+    /// too large to converge past the loss-plateau seen on tiny
+    /// fully-memorizable corpora (e.g. 1-digit arithmetic). No schedule/decay
+    /// — just a different constant.
+    #[clap(long, default_value_t = 0.001)]
+    pub lr: f64,
+
+    /// EXPERIMENTAL: compute `--train`'s SFT cross-entropy loss only over
+    /// "answer" token positions (the result digit(s) + trailing newline of
+    /// each `a op b=c` line) instead of uniformly over every token in the
+    /// sampled window. Only meaningful with `--tokenizer char` on an
+    /// arithmetic-shaped corpus (see `dataset::compute_answer_mask`) — for
+    /// any other corpus/tokenizer this silently falls back to the unmasked
+    /// loss (mask defaults to all-1.0). Off by default.
+    #[clap(long, default_value = "false")]
+    pub mask_loss: bool,
+
+    /// EXPERIMENTAL (Hypothesis B, train/inference format-mismatch test):
+    /// sample `--train`'s SFT training windows ONLY from true `"a op b="`
+    /// fact boundaries (offset 0, or immediately after a `\n`) instead of
+    /// uniformly over the whole encoded corpus. Motivation: with uniform
+    /// sampling, only ~1-in-6 to 1-in-7 training windows happen to start at
+    /// a real fact boundary — the rest start mid-fact, with "position 0" of
+    /// the window landing on an arbitrary character — while GRPO/RFT
+    /// sampling and `--eval` always present a clean, complete prompt
+    /// starting fresh at position 0. This flag removes that mismatch for
+    /// SFT. Only meaningful with `--tokenizer char` on an arithmetic-shaped
+    /// corpus (same assumption as `--mask-loss`/`dataset::compute_answer_mask`)
+    /// — for any other corpus/tokenizer this silently falls back to the
+    /// original uniform sampling. Off by default so existing training
+    /// behavior/models are completely unaffected.
+    #[clap(long, default_value = "false")]
+    pub aligned_windows: bool,
+
+    /// EXPERIMENTAL (Experiment A, init-scale ablation): stdev used for
+    /// `Init::Randn` when constructing a FRESH Gpt model, applied
+    /// consistently to every weight matrix (token/position embeddings,
+    /// attention Q/K/V/proj, MLP fc1/fc2, and `lm_head` when untied) — not
+    /// just the embedding tables, since mixing a small embedding-only init
+    /// with an unrelated default everywhere else would introduce a scale
+    /// mismatch rather than test the intended hypothesis. Defaults to `1.0`,
+    /// which is a special sentinel (see `model::gpt::DEFAULT_INIT_STD`) that
+    /// reproduces today's exact fresh-init scheme byte-for-byte (Kaiming-normal
+    /// weights for the attention/MLP `Linear` layers via candle_nn's own
+    /// `linear`/`linear_no_bias`, `Randn(0, 1.0)` for the embedding tables) —
+    /// so omitting this flag changes NOTHING about existing training runs.
+    /// Only meaningful when constructing a NEW model (`--train` without an
+    /// existing file at `--model-path`); ignored when loading an existing
+    /// `.bin` (the saved weights are used as-is regardless of what
+    /// `--init-std` was passed at load time).
+    #[clap(long, default_value_t = 1.0)]
+    pub init_std: f32,
+
+    /// EXPERIMENTAL (init-gain ablation, follow-up to Experiment A): override
+    /// the GAIN constant used in candle's own Kaiming-Normal weight init
+    /// (`std = gain / sqrt(fan_in)`) for every `Linear` layer built via
+    /// `model::gpt::build_linear` (attention Q/K/V/proj, MLP fc1/fc2, and
+    /// `lm_head` when untied — NOT the embedding tables, which are governed
+    /// by `--init-std` directly, and NOT `Linear` layers whose weights come
+    /// from `--init-std` instead of candle's default Kaiming-Normal — see
+    /// below). candle's own default is a hardcoded "textbook" ReLU gain of
+    /// √2≈1.414 (`Init::DEFAULT_KAIMING_NORMAL`); PyTorch's default `Linear`
+    /// init uses a much smaller gain of √(1/3)≈0.577. On a from-scratch
+    /// PyTorch replica of this repo's tiny (`hidden-size 16, num-heads 2,
+    /// num-blocks 4`) architecture, swapping to the smaller PyTorch-default
+    /// gain measurably raised final training accuracy on a trivial
+    /// single-digit-arithmetic memorization task versus candle's larger
+    /// default gain — this flag lets that hypothesis be tested directly in
+    /// the real Rust/candle model rather than only in the Python replica.
+    /// Unset (`None`, the CLI default) leaves candle's built-in gain (√2)
+    /// completely untouched — omitting this flag changes NOTHING about
+    /// existing training runs. Precedence versus `--init-std`: `--init-std`
+    /// is the more direct override (it sets the absolute stdev, not just the
+    /// gain feeding into a fan-in-scaled formula), so if `--init-std` is set
+    /// away from its own sentinel (`1.0`), it wins and `--init-gain` is
+    /// ignored — the two flags are meant to be used one at a time, not
+    /// combined. Only meaningful when constructing a NEW model (same
+    /// ignored-on-load rule as `--init-std`).
+    #[clap(long)]
+    pub init_gain: Option<f64>,
+
+    /// EXPERIMENTAL (Experiment B, weight tying): make `lm_head` reuse
+    /// `token_embeddings`' weight tensor directly (transposed at matmul time
+    /// by `Linear::forward`, same as any other `Linear`) instead of
+    /// allocating an independent `(vocab_size, hidden_size)` matrix. A
+    /// separate small `lm_head.bias` is still kept. Off by default so
+    /// existing models/behavior are completely unaffected. MUST be passed
+    /// consistently between the run that created a model (`--train`) and any
+    /// later run that loads it (`--eval`/`--rft`/`--grpo`/`--quantize`/
+    /// `--generate` with `-p` pointing at that file) — like `--num-heads`/
+    /// `--hidden-size`, this describes the saved architecture, not a
+    /// runtime-only toggle, and passing the wrong value will fail to load
+    /// (untied-but-actually-tied) or silently skip loading `lm_head`'s real
+    /// trained weights (tied-but-actually-untied).
+    #[clap(long, default_value = "false")]
+    pub tie_embeddings: bool,
 
     /// Random seed for batch sampling and token generation (reproducible runs).
     /// Note: fresh model init uses candle's CPU RNG which cannot be seeded in
@@ -216,9 +328,34 @@ pub struct Args {
     #[clap(long, default_value_t = 1)]
     pub grpo_epochs: usize,
 
+    /// Post-training INT8 quantization for storage: load an existing model
+    /// (`-p <model>.bin`), quantize every trainable tensor to int8 (per-tensor
+    /// symmetric scale, see `crate::quantize`'s module doc), and write it as a
+    /// new variant `<stem>-quant.bin`, registered in `smolgpt.db` linked to
+    /// the base model via `base_model_id` (same "derive a variant, never
+    /// mutate the base" pattern `--rft`/`--grpo` use). Forward passes still
+    /// run in f32 (weights are dequantized on load) — this only shrinks the
+    /// on-disk file (~4x smaller: int8 is 1 byte vs f32's 4 bytes, modulo
+    /// small header/scale overhead).
+    #[clap(long, default_value = "false", group = "mode")]
+    pub quantize: bool,
+
     /// Start a local web UI to browse models, datasets, and run evals.
     #[clap(long, default_value = "false", group = "mode")]
     pub serve: bool,
+
+    /// "Compiled" precompute: after `--train` finishes (Gpt-type models
+    /// only), automatically run the Jacobian-lens interpretability analysis
+    /// (see `crate::jacobian_lens` / `analysis/jacobian_lens.py`) and cache
+    /// the result in `smolgpt.db`, the same way `--serve`'s Jacobian tab
+    /// would on-demand -- so the result is already there, no UI click
+    /// needed, the moment training finishes. Ignored (with a printed note,
+    /// not an error) for `-m bigram`/`-m ngram`, which have no transformer
+    /// layers to lens through. Off by default since it shells out to a
+    /// separate Python/torch process and is noticeably slower than the rest
+    /// of `--train`.
+    #[clap(long, default_value = "false")]
+    pub jacobian_lens: bool,
 
     /// Port for the --serve web UI.
     #[clap(long, default_value_t = 8080)]
@@ -265,13 +402,35 @@ pub struct Args {
     #[clap(long, default_value_t = 16)]
     pub block_size: usize,
 
+    /// N-gram order (`N`) for `-m ngram`: the model conditions its
+    /// prediction on the previous `N - 1` tokens (a composite key into an
+    /// `Embedding(vocab_size^(N-1), vocab_size)` table — see
+    /// `model::ngram::NgramLM`). `N = 2` is bigram-equivalent (conditions on
+    /// just the current/most-recent token, matching `-m bigram` exactly).
+    /// Ignored for `-m gpt`/`-m bigram`. When `-m ngram` is used, this value
+    /// OVERRIDES `--block-size`: the effective context length used to build/
+    /// load the model (and stored in the registry) is `ngram_order - 1`, so
+    /// `--block-size` doesn't need to be set separately for ngram runs.
+    #[clap(long, default_value_t = 2)]
+    pub ngram_order: usize,
+
     /// Hidden / embedding dimension. Must match the saved model when loading.
     #[clap(long, default_value_t = 16)]
     pub hidden_size: usize,
 
-    /// Number of attention heads. Must match the saved model when loading.
-    #[clap(long, default_value_t = 4)]
-    pub num_heads: usize,
+    /// Number of attention heads. Either a single number, applied uniformly
+    /// to every transformer block (e.g. `--num-heads 4`, today's behavior),
+    /// or a comma-separated list with exactly `--num-blocks` entries, one
+    /// per block, for a non-uniform architecture (e.g. `--num-heads
+    /// 1,2,4,8` for a 4-block model: block 0 gets 1 head, block 1 gets 2,
+    /// etc). Each entry must individually divide `--hidden-size` evenly.
+    /// Must match the saved model when loading (same rule for both forms).
+    /// `value_delimiter = ','` makes clap split a single `--num-heads`
+    /// occurrence on commas into this `Vec` (a bare `--num-heads 4` yields
+    /// the single-element `[4]`); see `model::resolve_heads_schedule` for
+    /// how the `[4]` vs `[h0..hN]` cases are told apart and applied.
+    #[clap(long, default_value = "4", value_delimiter = ',')]
+    pub num_heads: Vec<usize>,
 
     /// Number of transformer blocks. Must match the saved model when loading.
     #[clap(long, default_value_t = 2)]

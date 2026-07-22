@@ -291,6 +291,9 @@ pub fn run_rft(
                 // SFT — the per-round upsert happens via the `on_round`
                 // callback below, at round granularity.
                 None,
+                0.001,
+                false,
+                None,
             )?;
             per_round_sft_final_losses.push(Some(sft_outcome.final_loss));
         }

@@ -1,11 +1,12 @@
 mod bigramlm;
 mod gpt;
+mod ngram;
 
 use crate::{
     args::ModelType,
     dataset::{Dataset, DatasetType},
     error::{SmolError, SmolResult},
-    model::{bigramlm::BigramLM, gpt::Gpt},
+    model::{bigramlm::BigramLM, gpt::Gpt, ngram::NgramLM},
 };
 use candle_core::{Device, IndexOp, Tensor, D};
 use candle_nn::{AdamW, Optimizer, ParamsAdamW, loss, ops::softmax};
@@ -51,6 +52,7 @@ impl TrainOutcome {
 pub enum LanguageModel {
     BigramLM(BigramLM),
     Gpt(Gpt),
+    Ngram(NgramLM),
 }
 
 impl LanguageModel {
@@ -59,32 +61,85 @@ impl LanguageModel {
         Ok(LanguageModel::BigramLM(model))
     }
 
+    /// `context_len` is `N - 1` (the number of preceding tokens the model
+    /// conditions on). Callers pass this via the (possibly overridden, see
+    /// `train.rs`) `block_size` value, since for `NgramLM` `block_size` IS
+    /// the real, meaningful context length (unlike `BigramLM`, which has no
+    /// such concept — see `get_block_size`'s doc).
+    pub fn new_ngram(vocab_size: usize, context_len: usize, device: &Device) -> SmolResult<Self> {
+        let n = context_len + 1;
+        let model = NgramLM::new(vocab_size, n, device)?;
+        Ok(LanguageModel::Ngram(model))
+    }
+
+    /// `num_heads` is the raw `--num-heads` value: either a single entry
+    /// (broadcast uniformly to every block, today's behavior) or exactly
+    /// `num_blocks` entries (one per block, for a non-uniform architecture).
+    /// See `resolve_heads_schedule` for the exact resolution rule/errors.
+    /// `init_std`/`tie_embeddings` are EXPERIMENTAL knobs (see `Gpt::new`'s
+    /// doc): controlling the fresh-init weight stdev and whether `lm_head`
+    /// reuses `token_embeddings`, respectively. Both default to the
+    /// unchanged-behavior sentinel at every existing call site (`1.0`,
+    /// `false`). `init_gain` (EXPERIMENTAL, `--init-gain`) is a further knob,
+    /// only meaningful when `init_std` is at its sentinel: `None` (the
+    /// default) leaves candle's own Kaiming-Normal gain (√2) untouched;
+    /// `Some(gain)` substitutes `gain` for it. See `Gpt::new`/`build_linear`'s
+    /// docs for the full precedence rule between `init_std` and `init_gain`.
     pub fn new_gpt(
         block_size: usize,
         vocab_size: usize,
         embed_dims: usize,
-        num_heads: usize,
+        num_heads: &[usize],
         num_blocks: usize,
+        init_std: f32,
+        init_gain: Option<f64>,
+        tie_embeddings: bool,
         device: &Device,
     ) -> SmolResult<Self> {
-        let model = Gpt::new(block_size, vocab_size, embed_dims, num_heads, num_blocks, device)?;
+        let heads_schedule = resolve_heads_schedule(num_heads, num_blocks)?;
+        let model = Gpt::new(
+            block_size,
+            vocab_size,
+            embed_dims,
+            &heads_schedule,
+            num_blocks,
+            init_std,
+            init_gain,
+            tie_embeddings,
+            device,
+        )?;
         Ok(LanguageModel::Gpt(model))
     }
 
+    /// `init_std`/`init_gain`/`tie_embeddings`: see `new_gpt`'s doc. Ignored
+    /// by `Bigram`/`Ngram` (neither has an init-scale or embedding-tying
+    /// concept).
     pub fn new(
         model_type: ModelType,
         block_size: usize,
         vocab_size: usize,
         hidden_size: usize,
-        num_heads: usize,
+        num_heads: &[usize],
         num_blocks: usize,
+        init_std: f32,
+        init_gain: Option<f64>,
+        tie_embeddings: bool,
         device: &Device,
     ) -> SmolResult<Self> {
         match model_type {
-            ModelType::Gpt => {
-                Self::new_gpt(block_size, vocab_size, hidden_size, num_heads, num_blocks, device)
-            }
+            ModelType::Gpt => Self::new_gpt(
+                block_size,
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_blocks,
+                init_std,
+                init_gain,
+                tie_embeddings,
+                device,
+            ),
             ModelType::Bigram => Self::new_bigram(vocab_size, device),
+            ModelType::Ngram => Self::new_ngram(vocab_size, block_size, device),
         }
     }
 
@@ -110,6 +165,9 @@ impl LanguageModel {
             true,
             0,
             0.0,
+            None,
+            0.001,
+            false,
             None,
         )?;
         Ok(())
@@ -140,6 +198,20 @@ impl LanguageModel {
     /// see the latest checkpoint). RFT's internal SFT sub-loop passes `None`
     /// — its per-round upserts happen at the round granularity via the
     /// `on_round` callback on `run_rft`/`run_grpo`, not per-SFT-checkpoint.
+    ///
+    /// `on_best_loss`: when `Some(cb)`, fired whenever the smoothed loss (the
+    /// same rolling-mean-over-`SMOOTH_WINDOW`-epochs value used for early
+    /// stopping) hits a NEW best-so-far value, subject to the throttle in
+    /// `should_snapshot` (see its doc for the exact policy/numbers). Called
+    /// as `cb(epoch_number_1_indexed, smoothed_loss, self)` — `self` is
+    /// passed through so the caller can run an exhaustive eval grid against
+    /// the model's CURRENT (mid-training) weights without this module
+    /// needing to know about tokenizers/eval-grids/the registry at all.
+    /// `train.rs`'s `--train` branch uses this to snapshot the exhaustive
+    /// eval grid into the `checkpoint_grids` table over the course of
+    /// training, so a follow-up UI can animate "how did the grid change as
+    /// training progressed". RFT's internal SFT sub-loop and the plain
+    /// `train` wrapper both pass `None`.
     pub fn train_with_dropout(
         &self,
         dataset: &mut Dataset,
@@ -150,15 +222,35 @@ impl LanguageModel {
         patience: usize,
         min_delta: f32,
         mut on_checkpoint: Option<&mut dyn FnMut(&TrainOutcome)>,
+        // EXPERIMENTAL knobs added to test two convergence hypotheses on the
+        // 1-digit-arithmetic SFT plateau: (1) a fixed learning rate other
+        // than candle's AdamW default of 1e-3, and (2) computing the loss
+        // only over "answer" token positions (see `dataset::compute_answer_mask`)
+        // instead of uniformly over every token in the window. Both default
+        // to old behavior at existing call sites (`lr=0.001`, `mask_loss=false`).
+        lr: f64,
+        mask_loss: bool,
+        mut on_best_loss: Option<&mut dyn FnMut(usize, f32, &LanguageModel)>,
     ) -> SmolResult<TrainOutcome> {
         const SMOOTH_WINDOW: usize = 20;
         let block_size = self.get_block_size();
-        let mut optimizer = AdamW::new(self.get_var_map().all_vars(), ParamsAdamW::default())?;
+        let mut adamw_params = ParamsAdamW::default();
+        adamw_params.lr = lr;
+        let mut optimizer = AdamW::new(self.get_var_map().all_vars(), adamw_params)?;
 
         let mut best_smoothed: f32 = f32::MAX;
         let mut epochs_no_improve: usize = 0;
         let mut recent_losses: std::collections::VecDeque<f32> =
             std::collections::VecDeque::with_capacity(SMOOTH_WINDOW);
+
+        // Checkpoint-grid snapshot throttle state (see `should_snapshot`'s
+        // doc for the policy). Tracked independently of `best_smoothed`
+        // above (which is early-stopping's own "best" and is only updated
+        // when `patience > 0`) so the snapshot trigger works regardless of
+        // whether early stopping is enabled.
+        let mut best_snapshot_loss: f32 = f32::MAX;
+        let mut last_snapshot_epoch: Option<usize> = None;
+        let mut last_snapshot_loss: f32 = f32::MAX;
 
         // Tracked so `train.rs` can record them in the model registry note.
         let mut epochs_run: usize = 0;
@@ -171,8 +263,22 @@ impl LanguageModel {
         let mut losses: Vec<f32> = Vec::with_capacity(num_epochs);
 
         for epoch in 0..num_epochs {
-            let (stacked_x, stacked_y) =
-                dataset.get_random_batches(DatasetType::Training, block_size, num_batches)?;
+            // EXPERIMENTAL branch: when `mask_loss` is set, pull the parallel
+            // per-token answer mask alongside x/y (see
+            // `dataset::compute_answer_mask` / `get_random_batches_masked`);
+            // otherwise use the original unmasked path unchanged.
+            let (stacked_x, stacked_y, stacked_mask) = if mask_loss {
+                let (x, y, m) = dataset.get_random_batches_masked(
+                    DatasetType::Training,
+                    block_size,
+                    num_batches,
+                )?;
+                (x, y, Some(m))
+            } else {
+                let (x, y) =
+                    dataset.get_random_batches(DatasetType::Training, block_size, num_batches)?;
+                (x, y, None)
+            };
             // Use the training-mode forward so dropout is active during
             // training. The inference forward (via `&dyn Module`) is a no-op
             // for dropout, which is what we want during `generate`.
@@ -181,10 +287,40 @@ impl LanguageModel {
             // Time size -> Number of tokens in each sequence (context length)
             // Channel size -> The dimension of each token's representation (here vocab size)
             let (batch_size, time_size, channel_size) = logits.shape().dims3()?;
-            let loss = loss::cross_entropy(
-                &logits.reshape((batch_size * time_size, channel_size))?,
-                &stacked_y.reshape((batch_size * time_size,))?,
-            )?;
+            let loss = match stacked_mask {
+                None => loss::cross_entropy(
+                    &logits.reshape((batch_size * time_size, channel_size))?,
+                    &stacked_y.reshape((batch_size * time_size,))?,
+                )?,
+                Some(mask) => {
+                    // Masked cross-entropy, computed by hand since
+                    // candle_nn::loss::cross_entropy always averages over
+                    // every position. Only "answer" positions (mask == 1.0)
+                    // contribute to the loss/gradient.
+                    let flat_logits =
+                        logits.reshape((batch_size * time_size, channel_size))?;
+                    let flat_targets = stacked_y.reshape((batch_size * time_size,))?;
+                    let flat_mask = mask.reshape((batch_size * time_size,))?;
+                    let log_probs = candle_nn::ops::log_softmax(&flat_logits, D::Minus1)?;
+                    // Per-row negative log-likelihood of the true next token:
+                    // gather the log-prob at the target index, then negate.
+                    let picked = log_probs
+                        .gather(&flat_targets.unsqueeze(1)?, 1)?
+                        .squeeze(1)?;
+                    let nll = picked.neg()?;
+                    let masked_nll = (nll.clone() * &flat_mask)?;
+                    let mask_sum = flat_mask.sum_all()?;
+                    // Guard against an all-zero mask (e.g. a window with no
+                    // answer position in it) so we don't divide by zero;
+                    // falls back to the unmasked mean loss for that batch.
+                    let mask_sum_scalar = mask_sum.to_scalar::<f32>()?;
+                    if mask_sum_scalar > 0.0 {
+                        (masked_nll.sum_all()? / mask_sum)?
+                    } else {
+                        nll.mean_all()?
+                    }
+                }
+            };
             // Looks like params.zero_grad()?; is not required in candle because gradients are accumulated externally
             let grads = loss.backward()?;
             optimizer.step(&grads)?;
@@ -218,17 +354,38 @@ impl LanguageModel {
                 }
             }
 
+            // Rolling-mean smoothing over the last SMOOTH_WINDOW epochs.
+            // Computed unconditionally (not gated on `patience > 0`) because
+            // both early stopping AND the checkpoint-grid snapshot trigger
+            // below need it.
+            recent_losses.push_back(epoch_loss);
+            if recent_losses.len() > SMOOTH_WINDOW {
+                recent_losses.pop_front();
+            }
+            let smoothed = recent_losses.iter().sum::<f32>() / recent_losses.len() as f32;
+
+            // Loss-improvement-triggered checkpoint-grid snapshot: fire
+            // `on_best_loss` whenever the smoothed loss hits a NEW best-ever
+            // value AND the throttle in `should_snapshot` allows it. Runs
+            // regardless of `patience` (early stopping may be disabled
+            // entirely, but snapshotting should still work).
+            if let Some(cb) = on_best_loss.as_mut() {
+                if smoothed < best_snapshot_loss {
+                    best_snapshot_loss = smoothed;
+                    if should_snapshot(epoch + 1, smoothed, last_snapshot_epoch, last_snapshot_loss)
+                    {
+                        cb(epoch + 1, smoothed, self);
+                        last_snapshot_epoch = Some(epoch + 1);
+                        last_snapshot_loss = smoothed;
+                    }
+                }
+            }
+
             // Early stopping: compare a rolling-mean loss against the best
             // seen so far. The window damps per-epoch noise (the 1-digit run
             // bounced +-0.03 around its plateau); min_delta prevents
             // sub-threshold drift from resetting the counter.
             if patience > 0 {
-                recent_losses.push_back(epoch_loss);
-                if recent_losses.len() > SMOOTH_WINDOW {
-                    recent_losses.pop_front();
-                }
-                let smoothed =
-                    recent_losses.iter().sum::<f32>() / recent_losses.len() as f32;
                 if best_smoothed - smoothed > min_delta {
                     best_smoothed = smoothed;
                     epochs_no_improve = 0;
@@ -282,6 +439,7 @@ impl LanguageModel {
         let embedding_table = match self {
             LanguageModel::BigramLM(model) => model.token_embedding.clone(),
             LanguageModel::Gpt(model) => model.token_embeddings.clone(),
+            LanguageModel::Ngram(model) => model.token_embedding.clone(),
         };
         let flattened = embedding_table.embeddings().to_vec2::<f32>()?;
         Ok(flattened)
@@ -353,7 +511,9 @@ impl LanguageModel {
                 LanguageModel::Gpt(model) => model.forward_with_training(&input, false)?,
                 // `get_model` returns `&dyn Module`, so `forward` is callable
                 // via the trait object without importing `Module` into scope.
-                LanguageModel::BigramLM(_) => self.get_model().forward(&input)?,
+                LanguageModel::BigramLM(_) | LanguageModel::Ngram(_) => {
+                    self.get_model().forward(&input)?
+                }
             };
 
             // Argmax over the vocab dimension at the last position.
@@ -405,7 +565,9 @@ impl LanguageModel {
             let input = Tensor::from_vec(ctx, (1, ctx_len), device)?;
             let logits = match self {
                 LanguageModel::Gpt(model) => model.forward_with_training(&input, false)?,
-                LanguageModel::BigramLM(_) => self.get_model().forward(&input)?,
+                LanguageModel::BigramLM(_) | LanguageModel::Ngram(_) => {
+                    self.get_model().forward(&input)?
+                }
             };
 
             let last_logits = logits.i((0, ctx_len - 1, ..))?;
@@ -439,6 +601,20 @@ impl LanguageModel {
         match self {
             LanguageModel::BigramLM(model) => model.save(path),
             LanguageModel::Gpt(model) => model.save(path),
+            LanguageModel::Ngram(model) => model.save(path),
+        }
+    }
+
+    /// Post-training INT8 quantization for storage (see `crate::quantize`'s
+    /// module doc for the scheme). Writes a quantized copy of `self`'s
+    /// weights to `path`; `self` is left unmodified. `--quantize` (see
+    /// `train.rs`) is the CLI entry point that calls this on an already
+    /// loaded base model to produce a `-quant.bin` variant.
+    pub fn save_quantized(&self, path: &std::path::PathBuf) -> SmolResult<()> {
+        match self {
+            LanguageModel::BigramLM(model) => model.save_quantized(path),
+            LanguageModel::Gpt(model) => model.save_quantized(path),
+            LanguageModel::Ngram(model) => model.save_quantized(path),
         }
     }
 
@@ -620,14 +796,19 @@ impl LanguageModel {
         device: &Device,
     ) -> SmolResult<LanguageModel> {
         self.save(path)?;
+        // Use the FULL per-block schedule (not `get_num_heads`'s collapsed
+        // representative value) so a non-uniform architecture reloads with
+        // the exact same per-block shapes, not a uniform approximation.
+        let heads_schedule = self.get_heads_schedule();
         LanguageModel::load(
             self.get_model_type(),
             path,
             self.get_block_size(),
             self.get_vocab_size(),
             self.get_hidden_size(),
-            self.get_num_heads(),
+            &heads_schedule,
             self.get_num_blocks(),
+            self.get_tie_embeddings(),
             device,
         )
     }
@@ -775,17 +956,26 @@ impl LanguageModel {
                 use candle_nn::Module;
                 Ok(model.forward(xs)?)
             }
+            LanguageModel::Ngram(model) => {
+                use candle_nn::Module;
+                Ok(model.forward(xs)?)
+            }
         }
     }
 
+    /// `num_heads` is the raw `--num-heads` value (see `new_gpt`'s doc for
+    /// the uniform-vs-per-block resolution rule). `tie_embeddings` MUST match
+    /// what the saved model was actually trained/constructed with (see
+    /// `Gpt::load`'s doc) — ignored for `Bigram`/`Ngram`.
     pub fn load(
         model_type: ModelType,
         path: &std::path::PathBuf,
         block_size: usize,
         vocab_size: usize,
         hidden_size: usize,
-        num_heads: usize,
+        num_heads: &[usize],
         num_blocks: usize,
+        tie_embeddings: bool,
         device: &Device,
     ) -> SmolResult<Self> {
         match model_type {
@@ -796,9 +986,11 @@ impl LanguageModel {
                 hidden_size,
                 num_heads,
                 num_blocks,
+                tie_embeddings,
                 device,
             ),
             ModelType::Bigram => Self::load_bigram(path, vocab_size, device),
+            ModelType::Ngram => Self::load_ngram(path, block_size, vocab_size, device),
         }
     }
 
@@ -811,22 +1003,38 @@ impl LanguageModel {
         Ok(LanguageModel::BigramLM(model))
     }
 
+    /// `context_len` is `N - 1`; see `new_ngram`'s doc for why it arrives via
+    /// the (possibly `train.rs`-overridden) `block_size` parameter.
+    pub fn load_ngram(
+        path: &std::path::PathBuf,
+        context_len: usize,
+        vocab_size: usize,
+        device: &Device,
+    ) -> SmolResult<Self> {
+        let n = context_len + 1;
+        let model = NgramLM::load(path, vocab_size, n, device)?;
+        Ok(LanguageModel::Ngram(model))
+    }
+
     pub fn load_gpt(
         path: &std::path::PathBuf,
         block_size: usize,
         vocab_size: usize,
         embed_dims: usize,
-        num_heads: usize,
+        num_heads: &[usize],
         num_blocks: usize,
+        tie_embeddings: bool,
         device: &Device,
     ) -> SmolResult<Self> {
+        let heads_schedule = resolve_heads_schedule(num_heads, num_blocks)?;
         let model = Gpt::load(
             path,
             block_size,
             vocab_size,
             embed_dims,
-            num_heads,
+            &heads_schedule,
             num_blocks,
+            tie_embeddings,
             device,
         )?;
         Ok(LanguageModel::Gpt(model))
@@ -836,6 +1044,7 @@ impl LanguageModel {
         match self {
             LanguageModel::BigramLM(model) => model,
             LanguageModel::Gpt(model) => model,
+            LanguageModel::Ngram(model) => model,
         }
     }
 
@@ -843,6 +1052,7 @@ impl LanguageModel {
         match self {
             LanguageModel::BigramLM(model) => &model.var_map,
             LanguageModel::Gpt(model) => &model.var_map,
+            LanguageModel::Ngram(model) => &model.var_map,
         }
     }
 
@@ -858,6 +1068,14 @@ impl LanguageModel {
             // case; it is not meaningful as a context length.
             LanguageModel::BigramLM(model) => model.vocab_size,
             LanguageModel::Gpt(model) => model.block_size,
+            // Unlike BigramLM, NgramLM DOES have a real, meaningful context
+            // length: N-1 conditioning tokens. Return it as the actual
+            // block-size value (not a stand-in), so truncation logic in
+            // `generate`/`generate_greedy_from_prompt`/`sample_from_prompt`/
+            // `grpo_step` behaves correctly for ngram — a window longer than
+            // N-1 tokens is truncated to just the tokens that matter for the
+            // next-token key anyway.
+            LanguageModel::Ngram(model) => model.context_len(),
         }
     }
 
@@ -868,23 +1086,68 @@ impl LanguageModel {
         match self {
             LanguageModel::BigramLM(model) => model.vocab_size,
             LanguageModel::Gpt(model) => model.vocab_size,
+            LanguageModel::Ngram(model) => model.vocab_size,
         }
     }
 
     /// Hidden / embedding dimension. BigramLM has no concept of a hidden dim
     /// (its embedding table is square `vocab x vocab`), so it returns 0 —
     /// `load_bigram` ignores this value anyway. Gpt stores it as a field.
+    /// NgramLM likewise has no hidden-dim concept (a single lookup table),
+    /// so it also returns 0.
     pub fn get_hidden_size(&self) -> usize {
         match self {
             LanguageModel::BigramLM(_) => 0,
             LanguageModel::Gpt(model) => model.embed_dims,
+            LanguageModel::Ngram(_) => 0,
         }
     }
 
+    /// A single representative head count: the minimum entry of the
+    /// per-block `heads_schedule` (equal to the common value when the
+    /// architecture is uniform, which is the overwhelmingly common case).
+    /// Used where only a scalar makes sense — e.g. the registry's single
+    /// `num_heads` column, which predates per-block schedules and isn't
+    /// worth migrating for this. `get_heads_schedule` below is the actual
+    /// source of truth for reconstructing a model's exact per-block shapes.
+    /// Kept `pub` as a small, independently useful API (mirrors
+    /// `get_num_blocks`/`get_hidden_size`); only exercised directly by tests
+    /// right now, hence `allow(dead_code)` for non-test builds.
+    #[allow(dead_code)]
     pub fn get_num_heads(&self) -> usize {
         match self {
             LanguageModel::BigramLM(_) => 0,
-            LanguageModel::Gpt(model) => model.num_heads,
+            LanguageModel::Gpt(model) => {
+                model.heads_schedule.iter().copied().min().unwrap_or(0)
+            }
+            LanguageModel::Ngram(_) => 0,
+        }
+    }
+
+    /// Full per-block head-count schedule, length == `get_num_blocks()`.
+    /// This is the source of truth `snapshot` uses to reload a frozen
+    /// reference copy with the EXACT same per-block shapes, whether the
+    /// architecture is uniform or not (unlike `get_num_heads`, which
+    /// collapses the schedule to a single representative value). Empty for
+    /// `BigramLM` (no heads concept).
+    pub fn get_heads_schedule(&self) -> Vec<usize> {
+        match self {
+            LanguageModel::BigramLM(_) => Vec::new(),
+            LanguageModel::Gpt(model) => model.heads_schedule.clone(),
+            LanguageModel::Ngram(_) => Vec::new(),
+        }
+    }
+
+    /// EXPERIMENTAL (Experiment B): whether `lm_head` is tied to
+    /// `token_embeddings` (see `Gpt::new`'s doc). `false` for
+    /// `Bigram`/`Ngram` (neither has an `lm_head`/embedding-tying concept).
+    /// Used by `snapshot` so a frozen reference copy of a tied model reloads
+    /// with the same wiring instead of defaulting to untied.
+    pub fn get_tie_embeddings(&self) -> bool {
+        match self {
+            LanguageModel::BigramLM(_) => false,
+            LanguageModel::Gpt(model) => model.tie_embeddings,
+            LanguageModel::Ngram(_) => false,
         }
     }
 
@@ -892,6 +1155,7 @@ impl LanguageModel {
         match self {
             LanguageModel::BigramLM(_) => 0,
             LanguageModel::Gpt(model) => model.num_blocks,
+            LanguageModel::Ngram(_) => 0,
         }
     }
 
@@ -901,7 +1165,92 @@ impl LanguageModel {
         match self {
             LanguageModel::BigramLM(_) => ModelType::Bigram,
             LanguageModel::Gpt(_) => ModelType::Gpt,
+            LanguageModel::Ngram(_) => ModelType::Ngram,
         }
+    }
+}
+
+/// Minimum epoch gap between checkpoint-grid snapshots (`on_best_loss`
+/// firings). Early in training, the smoothed loss can hit a new best-ever
+/// value on nearly every single epoch — a naive "snapshot on every new best"
+/// policy over a run of a few thousand epochs would compute an exhaustive
+/// eval grid (a full greedy-decode forward pass per cell) thousands of times,
+/// which is wasteful even for a small 10x10 grid and would badly hurt
+/// larger-range models. 25 (slightly more than `SMOOTH_WINDOW`'s 20, so
+/// consecutive snapshots reflect genuinely different smoothing windows
+/// rather than heavily-overlapping ones) bounds a 4000-epoch run to at most
+/// 4000/25 = 160 snapshots, and a 10000-epoch run to at most 400 — both
+/// comfortably cheap for this project's ~7K-param models and small corpora.
+pub const MIN_SNAPSHOT_GAP_EPOCHS: usize = 25;
+
+/// Minimum relative improvement (over the LAST STORED snapshot's smoothed
+/// loss) required for a new best-ever smoothed loss to actually fire another
+/// checkpoint-grid snapshot, even once `MIN_SNAPSHOT_GAP_EPOCHS` has
+/// elapsed. Guards against "new best by a rounding-error amount" re-firing
+/// every eligible epoch once the gap has passed and the loss is essentially
+/// flat (e.g. deep into a long plateau). 0.5% is small enough to still catch
+/// every meaningful step down the loss curve (the interesting frames for the
+/// eventual grid-animation UI) but large enough to skip noise-level
+/// "improvements".
+pub const MIN_SNAPSHOT_REL_IMPROVEMENT: f32 = 0.005;
+
+/// Decide whether a new best-ever smoothed loss (already confirmed by the
+/// caller: `smoothed < best_snapshot_loss`) should actually fire a
+/// checkpoint-grid snapshot, given the throttle state. Extracted as a pure,
+/// side-effect-free function (rather than inlined in the training loop) so
+/// the throttle policy is unit-testable without spinning up a model/dataset.
+///
+/// Policy (see the constants' docs for the exact numbers and reasoning):
+/// - The very first snapshot (`last_snapshot_epoch == None`) always fires —
+///   we always want a frame at/near the start of training for the animation.
+/// - After that, a new best only fires a snapshot if BOTH:
+///   1. at least `MIN_SNAPSHOT_GAP_EPOCHS` epochs have elapsed since the
+///      last snapshot, AND
+///   2. the new smoothed loss is at least `MIN_SNAPSHOT_REL_IMPROVEMENT`
+///      relatively better than the last snapshot's smoothed loss.
+fn should_snapshot(
+    epoch: usize,
+    smoothed: f32,
+    last_snapshot_epoch: Option<usize>,
+    last_snapshot_loss: f32,
+) -> bool {
+    let Some(last_epoch) = last_snapshot_epoch else {
+        return true;
+    };
+    let gap_ok = epoch.saturating_sub(last_epoch) >= MIN_SNAPSHOT_GAP_EPOCHS;
+    // `last_snapshot_loss` is always finite here (it was set the last time
+    // `last_snapshot_epoch` was set), but guard the denominator anyway so a
+    // pathological ~0 loss can't divide-by-zero into NaN/inf.
+    let denom = last_snapshot_loss.abs().max(1e-9);
+    let rel_improve_ok = (last_snapshot_loss - smoothed) / denom >= MIN_SNAPSHOT_REL_IMPROVEMENT;
+    gap_ok && rel_improve_ok
+}
+
+/// Resolve the raw `--num-heads` CLI value into a full per-block head-count
+/// schedule of length `num_blocks`.
+///
+/// - `num_heads.len() == 1`: uniform architecture (today's behavior) —
+///   broadcast that single value to every block.
+/// - `num_heads.len() == num_blocks`: an explicit per-block schedule, used
+///   as-is.
+/// - anything else: a clear error naming both lengths, since silently
+///   truncating/padding would build the wrong architecture without the
+///   caller noticing until a shape mismatch (or worse, a silently-wrong
+///   model) surfaced much later.
+///
+/// Per-block divisibility against `hidden_size` is NOT checked here — that's
+/// `Gpt::new`/`Gpt::load`'s job (via `validate_heads_schedule`), since this
+/// function also runs for `BigramLM` (via `LanguageModel::new`/`load`'s
+/// dispatch), which has no hidden-size/head-count concept at all.
+pub fn resolve_heads_schedule(num_heads: &[usize], num_blocks: usize) -> SmolResult<Vec<usize>> {
+    match num_heads.len() {
+        1 => Ok(vec![num_heads[0]; num_blocks]),
+        n if n == num_blocks => Ok(num_heads.to_vec()),
+        n => Err(SmolError::invalid_argument(&format!(
+            "--num-heads has {n} entries but num_blocks is {num_blocks}; pass either a \
+             single number (applied to every block) or a comma-separated list with \
+             exactly {num_blocks} entries, e.g. --num-heads 1,2,4,8"
+        ))),
     }
 }
 
@@ -918,15 +1267,76 @@ mod tests {
     use rstest::rstest;
     use temp_dir::TempDir;
 
+    #[test]
+    fn test_should_snapshot_always_fires_first_time() {
+        // No prior snapshot -> always fires, regardless of loss/epoch value.
+        assert!(should_snapshot(1, 100.0, None, f32::MAX));
+        assert!(should_snapshot(1, 0.0001, None, f32::MAX));
+    }
+
+    #[test]
+    fn test_should_snapshot_blocks_on_epoch_gap() {
+        // Big relative improvement, but not enough epochs have elapsed.
+        let last_epoch = 100;
+        let last_loss = 1.0;
+        assert!(!should_snapshot(
+            last_epoch + MIN_SNAPSHOT_GAP_EPOCHS - 1,
+            0.1,
+            Some(last_epoch),
+            last_loss
+        ));
+        // Exactly the gap threshold -> allowed (gap check is >=).
+        assert!(should_snapshot(
+            last_epoch + MIN_SNAPSHOT_GAP_EPOCHS,
+            0.1,
+            Some(last_epoch),
+            last_loss
+        ));
+    }
+
+    #[test]
+    fn test_should_snapshot_blocks_on_insufficient_relative_improvement() {
+        let last_epoch = 100;
+        let next_epoch = last_epoch + MIN_SNAPSHOT_GAP_EPOCHS;
+        let last_loss = 1.0;
+        // 0.1% improvement < the 0.5% threshold -> blocked.
+        assert!(!should_snapshot(next_epoch, 0.999, Some(last_epoch), last_loss));
+        // 1% improvement >= the 0.5% threshold -> allowed.
+        assert!(should_snapshot(next_epoch, 0.99, Some(last_epoch), last_loss));
+    }
+
+    #[test]
+    fn test_should_snapshot_requires_both_conditions() {
+        let last_epoch = 100;
+        let last_loss = 1.0;
+        // Gap satisfied but improvement not -> blocked.
+        assert!(!should_snapshot(
+            last_epoch + MIN_SNAPSHOT_GAP_EPOCHS,
+            0.999,
+            Some(last_epoch),
+            last_loss
+        ));
+        // Improvement satisfied but gap not -> blocked.
+        assert!(!should_snapshot(last_epoch + 1, 0.5, Some(last_epoch), last_loss));
+        // Both satisfied -> fires.
+        assert!(should_snapshot(
+            last_epoch + MIN_SNAPSHOT_GAP_EPOCHS,
+            0.5,
+            Some(last_epoch),
+            last_loss
+        ));
+    }
+
     #[rstest]
     #[case("bigramlm")]
     #[case("gpt")]
+    #[case("ngram")]
     fn test_lm_save_load_preserves_weights(#[case] model_type: &str) {
         let device = Device::Cpu;
         let vocab_size = 100;
         let hidden_size = 64;
         let block_size = 16;
-        let num_heads = 4;
+        let num_heads = [4];
         let num_blocks = 2;
 
         let model = match model_type {
@@ -935,11 +1345,19 @@ mod tests {
                 block_size,
                 vocab_size,
                 hidden_size,
-                num_heads,
+                &num_heads,
                 num_blocks,
+                1.0,
+                None,
+                false,
                 &device,
             )
             .unwrap(),
+            // A small context_len (2), independent of the shared block_size=16
+            // used by the gpt/bigram cases above: NgramLM's embedding table is
+            // vocab_size^context_len rows, so context_len=16 with vocab_size=100
+            // would be astronomically large.
+            "ngram" => LanguageModel::new_ngram(vocab_size, 2, &device).unwrap(),
             _ => panic!("Unknown model type {model_type}"),
         };
 
@@ -954,11 +1372,13 @@ mod tests {
                 block_size,
                 vocab_size,
                 hidden_size,
-                num_heads,
+                &num_heads,
                 num_blocks,
+                false,
                 &device,
             )
             .unwrap(),
+            "ngram" => LanguageModel::load_ngram(&path, 2, vocab_size, &device).unwrap(),
             _ => panic!("Unknown model type {model_type}"),
         };
 
@@ -978,12 +1398,13 @@ mod tests {
     #[rstest]
     #[case("bigramlm")]
     #[case("gpt")]
+    #[case("ngram")]
     fn test_completion_logp_scalar(#[case] model_type: &str) {
         let device = Device::Cpu;
         let vocab_size = 100;
         let hidden_size = 64;
         let block_size = 16;
-        let num_heads = 4;
+        let num_heads = [4];
         let num_blocks = 2;
 
         let model = match model_type {
@@ -992,11 +1413,17 @@ mod tests {
                 block_size,
                 vocab_size,
                 hidden_size,
-                num_heads,
+                &num_heads,
                 num_blocks,
+                1.0,
+                None,
+                false,
                 &device,
             )
             .unwrap(),
+            // Small context_len (2), independent of the shared block_size=16
+            // used by gpt (see test_lm_save_load_preserves_weights's comment).
+            "ngram" => LanguageModel::new_ngram(vocab_size, 2, &device).unwrap(),
             _ => panic!("Unknown model type {model_type}"),
         };
 
@@ -1030,12 +1457,13 @@ mod tests {
     #[rstest]
     #[case("bigramlm")]
     #[case("gpt")]
+    #[case("ngram")]
     fn test_grpo_step_full_guard_and_step(#[case] model_type: &str) {
         let device = Device::Cpu;
         let vocab_size = 100;
         let hidden_size = 64;
         let block_size = 16;
-        let num_heads = 4;
+        let num_heads = [4];
         let num_blocks = 2;
 
         let model = match model_type {
@@ -1044,11 +1472,17 @@ mod tests {
                 block_size,
                 vocab_size,
                 hidden_size,
-                num_heads,
+                &num_heads,
                 num_blocks,
+                1.0,
+                None,
+                false,
                 &device,
             )
             .unwrap(),
+            // Small context_len (2), independent of the shared block_size=16
+            // used by gpt (see test_lm_save_load_preserves_weights's comment).
+            "ngram" => LanguageModel::new_ngram(vocab_size, 2, &device).unwrap(),
             _ => panic!("Unknown model type {model_type}"),
         };
 
@@ -1104,12 +1538,13 @@ mod tests {
     #[rstest]
     #[case("bigramlm")]
     #[case("gpt")]
+    #[case("ngram")]
     fn test_snapshot_is_independent_copy(#[case] model_type: &str) {
         let device = Device::Cpu;
         let vocab_size = 100;
         let hidden_size = 64;
         let block_size = 16;
-        let num_heads = 4;
+        let num_heads = [4];
         let num_blocks = 2;
 
         let model = match model_type {
@@ -1118,11 +1553,17 @@ mod tests {
                 block_size,
                 vocab_size,
                 hidden_size,
-                num_heads,
+                &num_heads,
                 num_blocks,
+                1.0,
+                None,
+                false,
                 &device,
             )
             .unwrap(),
+            // Small context_len (2), independent of the shared block_size=16
+            // used by gpt (see test_lm_save_load_preserves_weights's comment).
+            "ngram" => LanguageModel::new_ngram(vocab_size, 2, &device).unwrap(),
             _ => panic!("Unknown model type {model_type}"),
         };
 

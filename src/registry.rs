@@ -93,6 +93,31 @@ pub struct ModelRecord {
     pub hidden_size: i64,
     pub num_heads: i64,
     pub num_blocks: i64,
+    /// Full per-block head-count schedule, as the same comma-separated
+    /// string syntax `--num-heads` accepts (e.g. `"1,1,4,4"`, or `"4"` for a
+    /// uniform architecture) — round-trips directly into a `--num-heads`
+    /// value. This is the LOSSLESS source of truth for reconstructing a
+    /// model's exact per-block shapes; `num_heads` above is only a
+    /// quick-glance summary (`min` of this schedule) and must not be used
+    /// for reconstruction. Empty string for rows written before this column
+    /// existed (see `migrate_add_heads_schedule_column`'s doc) — callers
+    /// that need a schedule for such a row should fall back to treating
+    /// `num_heads` as uniform (`vec![num_heads; num_blocks]`).
+    #[serde(default)]
+    pub heads_schedule: String,
+    /// Whether this model's SFT stage sampled training windows only from true
+    /// `"a op b="` fact boundaries (`--aligned-windows`, see
+    /// `dataset::compute_fact_boundaries`/`Dataset::sample_start_indices`).
+    /// `Some(true)`/`Some(false)` when known (every row written after this
+    /// column existed always records the actual CLI flag value used);
+    /// `None` (SQL NULL) for rows written before this column existed — their
+    /// true historical setting is genuinely NOT recoverable from the DB, so
+    /// callers (the Samples tab) must show "unknown" rather than silently
+    /// assuming either value. For an RL variant (RFT/GRPO), this describes
+    /// the variant's BASE model's SFT stage (copied via `TrainingMeta::with_variant`),
+    /// not the RL stage itself.
+    #[serde(default)]
+    pub aligned_windows: Option<bool>,
     pub dataset: String,
     pub dataset_name: String,
     pub eval_min: i64,
@@ -143,6 +168,124 @@ pub struct EvalRecord {
     pub run_at: i64,
 }
 
+/// The single cached `eval_grids` row for a model — the most recent
+/// exhaustive Grid-tab run. `report_json` is the serialized
+/// `crate::eval::EvalGridReport` (every cell, not just a summary — see the
+/// `eval_grids` table's doc for why this table keeps only one row per model
+/// instead of a history like `evals`). `eval_min`/`eval_max` are the model's
+/// operand range at the time this grid was computed; `latest_eval_grid`
+/// compares them against the model's *current* range and returns `None`
+/// (treats the cache as absent) on a mismatch, mirroring `latest_eval`'s
+/// smart-mode staleness handling for the sampled eval.
+#[derive(Debug, Clone, Serialize)]
+pub struct EvalGridRecord {
+    pub model_id: String,
+    pub eval_min: i64,
+    pub eval_max: i64,
+    pub report_json: String,
+    pub correct: i64,
+    pub total: i64,
+    #[serde(serialize_with = "serialize_iso_i64")]
+    pub run_at: i64,
+}
+
+/// One row in the `checkpoint_grids` table — a SINGLE point-in-training
+/// snapshot of the exhaustive eval grid, tagged with the epoch/loss at which
+/// it was taken. Unlike `eval_grids` (one row per model, overwritten in
+/// place on every recompute — see that table's doc), `checkpoint_grids`
+/// deliberately accumulates MULTIPLE rows per model over the course of a
+/// single `--train` run, so a follow-up UI can build a slider that animates
+/// through how the grid changed as training progressed. Written by
+/// `train.rs`'s `on_best_loss` callback (see `LanguageModel::train_with_dropout`)
+/// whenever the smoothed training loss hits a new best-so-far value, subject
+/// to the throttle documented on `model::should_snapshot`.
+///
+/// `report_json` is the same `crate::eval::EvalGridReport`-shaped JSON as
+/// `eval_grids.report_json`, for consistency between the two tables' payload
+/// shape. `loss` is the smoothed (rolling-mean) training loss at the epoch
+/// this snapshot was taken, matching the value `on_best_loss` fired on — NOT
+/// the raw per-epoch loss, so it's directly comparable to the early-stopping
+/// smoothing already used elsewhere in this codebase.
+#[derive(Debug, Clone, Serialize)]
+pub struct CheckpointGridRecord {
+    pub id: i64,
+    pub model_id: String,
+    pub epoch: i64,
+    pub loss: f64,
+    pub eval_min: i64,
+    pub eval_max: i64,
+    pub report_json: String,
+    pub correct: i64,
+    pub total: i64,
+    #[serde(serialize_with = "serialize_iso_i64")]
+    pub run_at: i64,
+}
+
+/// Lightweight metadata about a cached eval-grid row, surfaced on every
+/// `ModelView` via `/api/models` (mirroring how `cached_eval`'s summary is
+/// already embedded there) so the browser can tell "a cached grid exists"
+/// without a round trip, decide whether to show a "Recompute" vs "Run
+/// exhaustive grid" button label, and lazily fetch the full cached grid (via
+/// `GET /api/models/{id}/eval-grid`) only when one is known to exist. Does
+/// NOT carry `report_json` — that stays a deliberate extra (but cheap, DB-only)
+/// round trip, the same way `cached_eval` omits `by_digits`/`examples`.
+#[derive(Debug, Clone, Serialize)]
+pub struct EvalGridSummary {
+    pub eval_min: i64,
+    pub eval_max: i64,
+    pub correct: i64,
+    pub total: i64,
+    #[serde(serialize_with = "serialize_iso_i64")]
+    pub run_at: i64,
+}
+
+impl From<&EvalGridRecord> for EvalGridSummary {
+    fn from(r: &EvalGridRecord) -> EvalGridSummary {
+        EvalGridSummary {
+            eval_min: r.eval_min,
+            eval_max: r.eval_max,
+            correct: r.correct,
+            total: r.total,
+            run_at: r.run_at,
+        }
+    }
+}
+
+/// The single cached `jacobian_lens_results` row for a model — the most
+/// recent Jacobian-lens interpretability run (see `crate::jacobian_lens`).
+/// `results_json` is `analysis/jacobian_lens.py`'s `results.json` output
+/// verbatim; `plot_dir` is the directory (relative to the project root) the
+/// script wrote its PNG plots into; `plot_files` are the PNG filenames within
+/// that directory, served individually via
+/// `GET /api/models/{id}/jacobian-lens/plot/{filename}`.
+#[derive(Debug, Clone, Serialize)]
+pub struct JacobianLensRecord {
+    pub model_id: String,
+    pub results_json: String,
+    pub plot_dir: String,
+    pub plot_files: Vec<String>,
+    #[serde(serialize_with = "serialize_iso_i64")]
+    pub computed_at: i64,
+}
+
+/// Lightweight metadata about a cached Jacobian-lens run, surfaced on every
+/// `ModelView` via `/api/models` (mirroring `EvalGridSummary`) so the browser
+/// can tell "a cached analysis exists" without a round trip and skip straight
+/// to fetching the full cached result when the Jacobian tab is opened.
+#[derive(Debug, Clone, Serialize)]
+pub struct JacobianLensSummary {
+    #[serde(serialize_with = "serialize_iso_i64")]
+    pub computed_at: i64,
+}
+
+impl From<&JacobianLensRecord> for JacobianLensSummary {
+    fn from(r: &JacobianLensRecord) -> JacobianLensSummary {
+        JacobianLensSummary {
+            computed_at: r.computed_at,
+        }
+    }
+}
+
 /// One row in the `trainings` table — the metrics of a single training run
 /// (SFT or RFT). The structured payloads (`loss_trajectory`, `rft_summary`)
 /// are stored as JSON strings and parsed lazily by `serve.rs` when building
@@ -174,6 +317,26 @@ pub struct TrainingRecord {
     /// Raw JSON string of the `RftSummary` (RFT) or `"null"` (SFT). Parsed
     /// into `RftSummaryView` by `serve.rs` for the UI per-round table.
     pub rft_summary_json: String,
+    /// Exact greedy-decoding accuracy over every parseable line of the
+    /// training corpus itself (not sampled — the literal training set),
+    /// computed once after SFT finishes. `None` for rows written before this
+    /// column existed, or for RFT/GRPO rows (their "training set" is the
+    /// per-round winners corpus, which changes every round, so a single
+    /// post-hoc number wouldn't mean the same thing). Distinct from `evals`,
+    /// which samples random operands from a configured range and may include
+    /// problems the corpus never contained.
+    pub train_correct: Option<i64>,
+    pub train_total: Option<i64>,
+    /// Inclusive operand range + comma-separated ops (e.g. `"+,-"`) this
+    /// row's RL stage actually sampled prompts from (`--rft-min`/`--rft-max`/
+    /// `--rft-ops` for `kind == "rft"`, `--grpo-min`/`--grpo-max`/`--grpo-ops`
+    /// for `kind == "grpo"`). `None` for SFT rows (no prompt-sampling
+    /// concept) and for RFT/GRPO rows written before these columns existed.
+    /// Used by `--serve`'s Samples tab to faithfully reconstruct the exact
+    /// prompt shape a variant's RL stage trained on.
+    pub prompt_min: Option<i64>,
+    pub prompt_max: Option<i64>,
+    pub prompt_ops: Option<String>,
     #[serde(serialize_with = "serialize_iso_i64")]
     pub trained_at: i64,
 }
@@ -198,8 +361,22 @@ pub struct TrainingMeta<'a> {
     pub tokenizer: TokenizerType,
     pub block_size: usize,
     pub hidden_size: usize,
-    pub num_heads: usize,
+    /// Full per-block head-count schedule (length == `num_blocks` for a GPT
+    /// model; empty for BigramLM, which has no heads concept). Uniform
+    /// architectures (the common case, e.g. `--num-heads 4`) are
+    /// `vec![4; num_blocks]` — there's no separate scalar field; the
+    /// `models.num_heads` DB column (which predates per-block schedules) is
+    /// derived from this as `min(heads_schedule)` in `from_training`, and the
+    /// exact schedule + the `--num-heads` value needed to reload it are
+    /// surfaced in the generated `note` for non-uniform architectures.
+    pub heads_schedule: &'a [usize],
     pub num_blocks: usize,
+    /// Whether `--aligned-windows` was passed for this SFT run. Always a
+    /// concrete `bool` here (never unknown) — a live `--train` run always
+    /// knows the actual CLI flag value; unknown only applies to rows written
+    /// before this field/column existed (see `ModelRecord.aligned_windows`'s
+    /// doc), which this `TrainingMeta` doesn't represent.
+    pub aligned_windows: bool,
     pub dataset_path: &'a Path,
     pub model_path: &'a Path,
     pub actual_vocab_size: usize,
@@ -274,6 +451,7 @@ impl Registry {
                 hidden_size INTEGER NOT NULL,
                 num_heads INTEGER NOT NULL,
                 num_blocks INTEGER NOT NULL,
+                heads_schedule TEXT NOT NULL DEFAULT '',
                 dataset TEXT NOT NULL,
                 dataset_name TEXT NOT NULL,
                 eval_min INTEGER NOT NULL,
@@ -319,7 +497,92 @@ impl Registry {
                 trained_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_trainings_model_id ON trainings(model_id);
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_trainings_model_kind ON trainings(model_id, kind);",
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_trainings_model_kind ON trainings(model_id, kind);
+            -- Cache of the most recent exhaustive eval-grid run per model
+            -- (`--serve`'s Grid tab). Unlike `evals` (a small per-run summary
+            -- row we keep a history of), a grid's `report_json` blob holds
+            -- every cell (prompt/generated/true_answer/diff for every (a,b)
+            -- combination) — potentially a few hundred KB for a 50x50 grid —
+            -- so we keep ONE row per model (model_id is the PRIMARY KEY) and
+            -- overwrite it on every recompute, the same 'single row that
+            -- updates in place' pattern `trainings` uses for its own large
+            -- JSON blob columns, rather than accumulating an unbounded
+            -- history of large blobs the way `evals` does for its small
+            -- summary rows. `eval_min`/`eval_max` are stamped at cache-write
+            -- time (mirroring `evals.eval_min`/`eval_max`) so `latest_eval_grid`
+            -- can detect a stale cache the same way `latest_eval` does: if the
+            -- model's current range no longer matches the cached row's range,
+            -- the cache is treated as absent rather than served stale. Uses a
+            -- real FK (unlike `trainings`' soft reference) because `models`
+            -- rows are only ever replaced via `ON CONFLICT DO UPDATE` (never
+            -- deleted-then-reinserted) for a same-id re-train, so there's no
+            -- risk of an UPSERT cascading away a cache that should survive —
+            -- the same reasoning `evals` already relies on for its FK.
+            CREATE TABLE IF NOT EXISTS eval_grids (
+                model_id TEXT PRIMARY KEY,
+                eval_min INTEGER NOT NULL,
+                eval_max INTEGER NOT NULL,
+                report_json TEXT NOT NULL,
+                correct INTEGER NOT NULL,
+                total INTEGER NOT NULL,
+                run_at INTEGER NOT NULL,
+                FOREIGN KEY (model_id) REFERENCES models(id) ON DELETE CASCADE
+            );
+            -- History of exhaustive-eval-grid snapshots taken DURING training,
+            -- one row per loss-improvement-triggered checkpoint (see
+            -- `model::should_snapshot` for the throttle policy). Unlike
+            -- `eval_grids` (one row per model, overwritten in place), this
+            -- table intentionally accumulates many rows per model_id so a
+            -- follow-up UI can animate through them with a slider ordered by
+            -- `epoch`. Uses a real FK (like `eval_grids`, unlike `trainings`'
+            -- soft reference) for the same reason `eval_grids` does: `models`
+            -- rows are only ever replaced via `ON CONFLICT DO UPDATE`, never
+            -- deleted-then-reinserted, so there's no risk of an UPSERT
+            -- cascading away history that should survive. A re-train under
+            -- the same model id WILL cascade-delete this model's prior
+            -- checkpoint-grid history (same as it would for `eval_grids`) —
+            -- that's intentional: a fresh training run's snapshots describe a
+            -- different loss curve than the old run's.
+            CREATE TABLE IF NOT EXISTS checkpoint_grids (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                model_id TEXT NOT NULL,
+                epoch INTEGER NOT NULL,
+                loss REAL NOT NULL,
+                eval_min INTEGER NOT NULL,
+                eval_max INTEGER NOT NULL,
+                report_json TEXT NOT NULL,
+                correct INTEGER NOT NULL,
+                total INTEGER NOT NULL,
+                run_at INTEGER NOT NULL,
+                FOREIGN KEY (model_id) REFERENCES models(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_checkpoint_grids_model_epoch
+                ON checkpoint_grids(model_id, epoch);
+            -- Cache of the most recent Jacobian-lens interpretability run per
+            -- model (`--serve`'s Jacobian tab, or `--train --jacobian-lens`'s
+            -- compiled precompute). One row per model (model_id is the
+            -- PRIMARY KEY), overwritten in place on every recompute -- same
+            -- 'single row, large blob, only the latest is useful' pattern as
+            -- `eval_grids`. `results_json` is the JSON `analysis/jacobian_lens.py`
+            -- writes to `results.json`. `plot_dir` is the directory (relative
+            -- to the project root) the script wrote its PNG plots into --
+            -- kept as files on disk rather than DB BLOBs because this
+            -- analysis is Gpt-only, low-volume (one row per model, not per
+            -- eval run), and file-based storage means the plots can be
+            -- inspected directly from the filesystem too; `plot_files` is a
+            -- JSON array of the PNG filenames within that directory, read by
+            -- `GET /api/models/{id}/jacobian-lens/plot/{filename}`. A re-train
+            -- under the same model id cascade-deletes this row (real FK, same
+            -- reasoning as `eval_grids`/`checkpoint_grids`) since a retrained
+            -- model's internals are a different analysis subject entirely.
+            CREATE TABLE IF NOT EXISTS jacobian_lens_results (
+                model_id TEXT PRIMARY KEY,
+                results_json TEXT NOT NULL,
+                plot_dir TEXT NOT NULL,
+                plot_files TEXT NOT NULL,
+                computed_at INTEGER NOT NULL,
+                FOREIGN KEY (model_id) REFERENCES models(id) ON DELETE CASCADE
+            );",
         )
         // The UNIQUE index enforces "one row per (model_id, kind)" at the
         // schema level, so `upsert_training` can rely on `ON CONFLICT` for an
@@ -347,6 +610,37 @@ impl Registry {
         // models) so they show up as nested variants after the migration. A
         // no-op once every matching row has `base_model_id` set.
         migrate_backfill_base_model_id(&conn)?;
+
+        // In-place migration: add `train_correct`/`train_total` to `trainings`
+        // so SFT runs can report exact greedy-decoding accuracy over the
+        // actual training corpus (distinct from `evals`, which samples random
+        // operands from a range and may include out-of-corpus problems).
+        // Existing rows get NULL (treated as "not computed" — pre-migration
+        // runs, or non-SFT rows).
+        migrate_add_train_accuracy_columns(&conn)?;
+
+        // In-place migration: add `heads_schedule` to `models` — the
+        // lossless per-block head-count schedule (CSV, same syntax
+        // `--num-heads` accepts), needed to correctly reload a non-uniform
+        // architecture. The scalar `num_heads` column alone is lossy (it's
+        // `min(heads_schedule)`, e.g. `[1,1,4,4]` and `[1,2,3,4]` both
+        // collapse to `num_heads=1`), so `--serve` needs this column to
+        // reconstruct the true per-block shapes. Existing rows get ''
+        // (empty string) — see the `ModelRecord.heads_schedule` field doc
+        // for how callers should fall back for those rows.
+        migrate_add_heads_schedule_column(&conn)?;
+
+        // In-place migration: add `aligned_windows` to `models` (see
+        // `ModelRecord.aligned_windows`'s doc). Existing rows get NULL
+        // (unknown historical setting).
+        migrate_add_aligned_windows_column(&conn)?;
+
+        // In-place migration: add `prompt_min`/`prompt_max`/`prompt_ops` to
+        // `trainings` (see `TrainingRecord`'s doc) so an RFT/GRPO row records
+        // the actual operand range + ops its RL stage sampled prompts from.
+        // Existing rows get NULL (unknown — pre-migration RFT/GRPO runs, or
+        // SFT rows, which have no prompt-sampling concept).
+        migrate_add_prompt_range_columns(&conn)?;
 
         Ok(Registry { conn })
     }
@@ -399,11 +693,12 @@ impl Registry {
             .execute(
                 "INSERT INTO models (
                     id, path, model_type, tokenizer, vocab_size, block_size,
-                    hidden_size, num_heads, num_blocks, dataset, dataset_name,
-                    eval_min, eval_max, eval_samples, note, params_estimate,
-                    base_model_id, created_at, updated_at
+                    hidden_size, num_heads, num_blocks, heads_schedule,
+                    aligned_windows, dataset,
+                    dataset_name, eval_min, eval_max, eval_samples, note,
+                    params_estimate, base_model_id, created_at, updated_at
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                          ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+                          ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
                 ON CONFLICT(id) DO UPDATE SET
                     path = excluded.path,
                     model_type = excluded.model_type,
@@ -413,6 +708,8 @@ impl Registry {
                     hidden_size = excluded.hidden_size,
                     num_heads = excluded.num_heads,
                     num_blocks = excluded.num_blocks,
+                    heads_schedule = excluded.heads_schedule,
+                    aligned_windows = excluded.aligned_windows,
                     dataset = excluded.dataset,
                     dataset_name = excluded.dataset_name,
                     eval_min = excluded.eval_min,
@@ -432,6 +729,8 @@ impl Registry {
                     rec.hidden_size,
                     rec.num_heads,
                     rec.num_blocks,
+                    rec.heads_schedule,
+                    rec.aligned_windows,
                     rec.dataset,
                     rec.dataset_name,
                     rec.eval_min,
@@ -455,9 +754,10 @@ impl Registry {
             .conn
             .prepare(
                 "SELECT id, path, model_type, tokenizer, vocab_size, block_size,
-                        hidden_size, num_heads, num_blocks, dataset, dataset_name,
-                        eval_min, eval_max, eval_samples, note, params_estimate,
-                        base_model_id, created_at, updated_at
+                        hidden_size, num_heads, num_blocks, heads_schedule,
+                        aligned_windows, dataset,
+                        dataset_name, eval_min, eval_max, eval_samples, note,
+                        params_estimate, base_model_id, created_at, updated_at
                  FROM models ORDER BY id",
             )
             .map_err(|e| SmolError::custom_error(&format!("list_models prepare: {e}")))?;
@@ -479,9 +779,10 @@ impl Registry {
             .conn
             .prepare(
                 "SELECT id, path, model_type, tokenizer, vocab_size, block_size,
-                        hidden_size, num_heads, num_blocks, dataset, dataset_name,
-                        eval_min, eval_max, eval_samples, note, params_estimate,
-                        base_model_id, created_at, updated_at
+                        hidden_size, num_heads, num_blocks, heads_schedule,
+                        aligned_windows, dataset,
+                        dataset_name, eval_min, eval_max, eval_samples, note,
+                        params_estimate, base_model_id, created_at, updated_at
                  FROM models WHERE id = ?1",
             )
             .map_err(|e| SmolError::custom_error(&format!("get_model prepare: {e}")))?;
@@ -607,6 +908,237 @@ impl Registry {
         Ok(row)
     }
 
+    /// Insert (or overwrite) the cached exhaustive-eval-grid row for a model.
+    /// One row per model (`model_id` is the table's PRIMARY KEY): unlike
+    /// `record_eval`, which appends a history row per run, this OVERWRITES the
+    /// previous cache on every recompute — see the `eval_grids` table's doc
+    /// for why (the JSON blob is large; only the latest grid is ever useful).
+    /// `eval_min`/`eval_max` are stamped from the model's *current* range so
+    /// `latest_eval_grid` can later detect a stale cache the same way
+    /// `latest_eval` does for the sampled eval.
+    pub fn record_eval_grid(
+        &self,
+        model_id: &str,
+        eval_min: i64,
+        eval_max: i64,
+        report_json: &str,
+        correct: i64,
+        total: i64,
+    ) -> SmolResult<()> {
+        self.conn
+            .execute(
+                "INSERT INTO eval_grids (model_id, eval_min, eval_max, report_json,
+                                          correct, total, run_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(model_id) DO UPDATE SET
+                    eval_min = excluded.eval_min,
+                    eval_max = excluded.eval_max,
+                    report_json = excluded.report_json,
+                    correct = excluded.correct,
+                    total = excluded.total,
+                    run_at = excluded.run_at",
+                params![model_id, eval_min, eval_max, report_json, correct, total, now_unix()],
+            )
+            .map_err(|e| SmolError::custom_error(&format!("record_eval_grid: {e}")))?;
+        Ok(())
+    }
+
+    /// The cached eval-grid row for a model, but only if its stamped
+    /// `eval_min`/`eval_max` still match the model's *current* range —
+    /// otherwise `None`, exactly like `latest_eval`'s smart-mode range
+    /// filter (a changed `--eval-min`/`--eval-max` must not silently serve a
+    /// grid computed for the old range). If the model isn't registered at
+    /// all, also returns `None` (there's no "current range" to compare
+    /// against). Returns `None` if there's no cached row yet.
+    pub fn latest_eval_grid(&self, model_id: &str) -> SmolResult<Option<EvalGridRecord>> {
+        let Some(current) = self.get_model(model_id)? else {
+            return Ok(None);
+        };
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT model_id, eval_min, eval_max, report_json, correct, total, run_at
+                 FROM eval_grids WHERE model_id = ?1",
+            )
+            .map_err(|e| SmolError::custom_error(&format!("latest_eval_grid prepare: {e}")))?;
+        let row = stmt
+            .query_row(params![model_id], map_eval_grid_row)
+            .optional()
+            .map_err(|e| SmolError::custom_error(&format!("latest_eval_grid query: {e}")))?;
+        Ok(row.filter(|r| r.eval_min == current.eval_min && r.eval_max == current.eval_max))
+    }
+
+    /// Insert (or overwrite) the cached Jacobian-lens result row for a model.
+    /// One row per model (`model_id` is the table's PRIMARY KEY) — unlike
+    /// `record_eval`, this overwrites the previous cache on every recompute,
+    /// mirroring `record_eval_grid` (there's no notion of a stale "range" for
+    /// this analysis — it's keyed purely on the model's current weights, so a
+    /// fresh run always simply replaces the old one).
+    pub fn record_jacobian_lens(
+        &self,
+        model_id: &str,
+        results_json: &str,
+        plot_dir: &str,
+        plot_files: &[String],
+    ) -> SmolResult<()> {
+        let plot_files_json = serde_json::to_string(plot_files)
+            .map_err(|e| SmolError::custom_error(&format!("record_jacobian_lens: serialize plot_files: {e}")))?;
+        self.conn
+            .execute(
+                "INSERT INTO jacobian_lens_results (model_id, results_json, plot_dir, plot_files, computed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(model_id) DO UPDATE SET
+                    results_json = excluded.results_json,
+                    plot_dir = excluded.plot_dir,
+                    plot_files = excluded.plot_files,
+                    computed_at = excluded.computed_at",
+                params![model_id, results_json, plot_dir, plot_files_json, now_unix()],
+            )
+            .map_err(|e| SmolError::custom_error(&format!("record_jacobian_lens: {e}")))?;
+        Ok(())
+    }
+
+    /// The cached Jacobian-lens row for a model, if one exists. Unlike
+    /// `latest_eval_grid`, there's no range-staleness check — this analysis
+    /// only goes stale when the model's weights change (a re-train), which
+    /// already cascade-deletes this row via the table's FK, so any row
+    /// present is always for the model's CURRENT weights.
+    pub fn latest_jacobian_lens(&self, model_id: &str) -> SmolResult<Option<JacobianLensRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT model_id, results_json, plot_dir, plot_files, computed_at
+                 FROM jacobian_lens_results WHERE model_id = ?1",
+            )
+            .map_err(|e| SmolError::custom_error(&format!("latest_jacobian_lens prepare: {e}")))?;
+        let row = stmt
+            .query_row(params![model_id], map_jacobian_lens_row)
+            .optional()
+            .map_err(|e| SmolError::custom_error(&format!("latest_jacobian_lens query: {e}")))?;
+        Ok(row)
+    }
+
+    /// Hard cap on stored `checkpoint_grids` rows per model. Even with the
+    /// epoch-gap throttle in `model::should_snapshot` (which already bounds a
+    /// 10000-epoch run to ~400 snapshots), this is a second, independent
+    /// safety net against unbounded growth — e.g. a very long or
+    /// very-slow-converging run. 300 is comfortably above what the gap
+    /// throttle alone produces for this project's typical run lengths (a few
+    /// thousand epochs), so in practice thinning rarely triggers; it exists
+    /// as a backstop, not the primary control.
+    const MAX_CHECKPOINT_GRIDS_PER_MODEL: i64 = 300;
+
+    /// Insert one exhaustive-eval-grid snapshot into the `checkpoint_grids`
+    /// history, then thin old rows if the model has exceeded
+    /// `MAX_CHECKPOINT_GRIDS_PER_MODEL`. Called from `train.rs`'s
+    /// `on_best_loss` callback (see `LanguageModel::train_with_dropout`)
+    /// once per throttled "new best smoothed loss" event.
+    pub fn record_checkpoint_grid(
+        &self,
+        model_id: &str,
+        epoch: usize,
+        loss: f64,
+        eval_min: i64,
+        eval_max: i64,
+        report_json: &str,
+        correct: i64,
+        total: i64,
+    ) -> SmolResult<()> {
+        self.conn
+            .execute(
+                "INSERT INTO checkpoint_grids (model_id, epoch, loss, eval_min, eval_max,
+                                                report_json, correct, total, run_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    model_id,
+                    epoch as i64,
+                    loss,
+                    eval_min,
+                    eval_max,
+                    report_json,
+                    correct,
+                    total,
+                    now_unix(),
+                ],
+            )
+            .map_err(|e| SmolError::custom_error(&format!("record_checkpoint_grid: {e}")))?;
+        self.thin_checkpoint_grids(model_id)?;
+        Ok(())
+    }
+
+    /// If `model_id` has more than `MAX_CHECKPOINT_GRIDS_PER_MODEL` rows,
+    /// delete roughly half of them via UNIFORM thinning (drop every other row
+    /// in epoch order, always keeping the very first and very last) rather
+    /// than a strict "drop oldest" policy. Uniform thinning preserves the
+    /// full epoch range (so the animation still has a start and end frame)
+    /// while still reducing storage/row count, whereas dropping only the
+    /// oldest rows would permanently destroy early-training resolution every
+    /// time the cap is hit.
+    fn thin_checkpoint_grids(&self, model_id: &str) -> SmolResult<()> {
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM checkpoint_grids WHERE model_id = ?1",
+                params![model_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| SmolError::custom_error(&format!("thin_checkpoint_grids count: {e}")))?;
+        if count <= Self::MAX_CHECKPOINT_GRIDS_PER_MODEL {
+            return Ok(());
+        }
+        let ids: Vec<i64> = self
+            .conn
+            .prepare(
+                "SELECT id FROM checkpoint_grids WHERE model_id = ?1 ORDER BY epoch ASC, id ASC",
+            )
+            .map_err(|e| SmolError::custom_error(&format!("thin_checkpoint_grids prepare: {e}")))?
+            .query_map(params![model_id], |row| row.get(0))
+            .map_err(|e| SmolError::custom_error(&format!("thin_checkpoint_grids query: {e}")))?
+            .filter_map(|r| r.ok())
+            .collect();
+        let n = ids.len();
+        for (i, id) in ids.iter().enumerate() {
+            // Always keep the first and last row (preserve the full epoch
+            // range); among the rest, drop every other one (even index).
+            if i == 0 || i == n - 1 {
+                continue;
+            }
+            if i % 2 == 0 {
+                self.conn
+                    .execute("DELETE FROM checkpoint_grids WHERE id = ?1", params![id])
+                    .map_err(|e| {
+                        SmolError::custom_error(&format!("thin_checkpoint_grids delete: {e}"))
+                    })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// All `checkpoint_grids` rows for a model, ordered by `epoch ASC` — the
+    /// full snapshot history a UI slider would animate through (oldest/lowest
+    /// epoch first). Returns an empty `Vec` (not an error) if the model has
+    /// no snapshots yet.
+    pub fn list_checkpoint_grids(&self, model_id: &str) -> SmolResult<Vec<CheckpointGridRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, model_id, epoch, loss, eval_min, eval_max, report_json,
+                        correct, total, run_at
+                 FROM checkpoint_grids WHERE model_id = ?1 ORDER BY epoch ASC, id ASC",
+            )
+            .map_err(|e| SmolError::custom_error(&format!("list_checkpoint_grids prepare: {e}")))?;
+        let rows = stmt
+            .query_map(params![model_id], map_checkpoint_grid_row)
+            .map_err(|e| SmolError::custom_error(&format!("list_checkpoint_grids query: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| {
+                SmolError::custom_error(&format!("list_checkpoint_grids row: {e}"))
+            })?);
+        }
+        Ok(out)
+    }
+
     /// Insert (or replace) a `trainings` row keyed on `(model_id, kind)`. Used
     /// for live progress: SFT calls this at each checkpoint (every 10 epochs +
     /// final), and RFT/GRPO call it after each round, so the web UI shows a
@@ -625,6 +1157,24 @@ impl Registry {
     /// `"null"` (per the schema's NOT NULL constraints we always store a
     /// string, never SQL NULL). `early_stopped` is stored as 0/1; `final_loss`
     /// is REAL.
+    /// `train_correct`/`train_total`: exact greedy-decoding accuracy over the
+    /// literal training corpus (see `TrainingRecord` doc). `None` for every
+    /// call except the final post-training upsert for an SFT row — passing
+    /// `None` from an intermediate checkpoint or from RFT/GRPO leaves the
+    /// column at its previous value only on `ON CONFLICT`'s first write; on a
+    /// fresh INSERT it's simply NULL. Callers that don't have a freshly
+    /// computed number (checkpoints, RFT/GRPO) MUST NOT overwrite a
+    /// previously-computed final number with `None`, so this method treats
+    /// `None` as "leave existing value alone" via `COALESCE` rather than a
+    /// literal overwrite.
+    ///
+    /// `prompt_min`/`prompt_max`/`prompt_ops`: the operand range + ops this
+    /// row's RL stage samples prompts from (`--rft-min`/`--rft-max`/
+    /// `--rft-ops` or `--grpo-min`/`--grpo-max`/`--grpo-ops`); `None` for SFT
+    /// calls (no prompt-sampling concept). Same `COALESCE`-on-`None`
+    /// treatment as `train_correct`/`train_total` above, though in practice
+    /// every RFT/GRPO round upserts the same constant value for the run.
+    #[allow(clippy::too_many_arguments)]
     pub fn upsert_training(
         &self,
         model_id: &str,
@@ -634,19 +1184,30 @@ impl Registry {
         final_loss: f32,
         loss_trajectory_json: &str,
         rft_summary_json: &str,
+        train_correct: Option<i64>,
+        train_total: Option<i64>,
+        prompt_min: Option<i64>,
+        prompt_max: Option<i64>,
+        prompt_ops: Option<&str>,
     ) -> SmolResult<()> {
         self.conn
             .execute(
                 "INSERT INTO trainings (model_id, kind, epochs_run, early_stopped,
                                         final_loss, loss_trajectory, rft_summary,
-                                        trained_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                                        train_correct, train_total,
+                                        prompt_min, prompt_max, prompt_ops, trained_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                  ON CONFLICT(model_id, kind) DO UPDATE SET
                     epochs_run = excluded.epochs_run,
                     early_stopped = excluded.early_stopped,
                     final_loss = excluded.final_loss,
                     loss_trajectory = excluded.loss_trajectory,
                     rft_summary = excluded.rft_summary,
+                    train_correct = COALESCE(excluded.train_correct, trainings.train_correct),
+                    train_total = COALESCE(excluded.train_total, trainings.train_total),
+                    prompt_min = COALESCE(excluded.prompt_min, trainings.prompt_min),
+                    prompt_max = COALESCE(excluded.prompt_max, trainings.prompt_max),
+                    prompt_ops = COALESCE(excluded.prompt_ops, trainings.prompt_ops),
                     trained_at = excluded.trained_at",
                 params![
                     model_id,
@@ -656,6 +1217,11 @@ impl Registry {
                     final_loss as f64,
                     loss_trajectory_json,
                     rft_summary_json,
+                    train_correct,
+                    train_total,
+                    prompt_min,
+                    prompt_max,
+                    prompt_ops,
                     now_unix(),
                 ],
             )
@@ -674,7 +1240,9 @@ impl Registry {
             .conn
             .prepare(
                 "SELECT id, model_id, kind, epochs_run, early_stopped,
-                        final_loss, loss_trajectory, rft_summary, trained_at
+                        final_loss, loss_trajectory, rft_summary,
+                        train_correct, train_total,
+                        prompt_min, prompt_max, prompt_ops, trained_at
                  FROM trainings WHERE model_id = ?1
                  ORDER BY trained_at DESC, id DESC LIMIT 1",
             )
@@ -737,6 +1305,16 @@ impl Registry {
                 hidden_size: entry.hidden_size as i64,
                 num_heads: entry.num_heads as i64,
                 num_blocks: entry.num_blocks as i64,
+                // The legacy TOML format has no per-block concept — every
+                // imported entry is a uniform architecture, so a bare
+                // (comma-free) number is the correct schedule string; it's
+                // also what `parse_heads_schedule_column` would fall back to
+                // anyway if this were left empty.
+                heads_schedule: entry.num_heads.to_string(),
+                // The legacy TOML format predates `--aligned-windows`
+                // entirely -- there's no historical setting to recover, so
+                // this is honestly "unknown" rather than a guessed default.
+                aligned_windows: None,
                 dataset: entry.dataset.clone(),
                 dataset_name: entry.dataset_name.clone(),
                 eval_min: entry.eval_min,
@@ -786,6 +1364,7 @@ impl ModelRecord {
         let model_type_str = match meta.model_type {
             ModelType::Gpt => "gpt",
             ModelType::Bigram => "bigram",
+            ModelType::Ngram => "ngram",
         };
         let tokenizer_str = match meta.tokenizer {
             TokenizerType::Char => "char",
@@ -812,18 +1391,26 @@ impl ModelRecord {
             meta.num_blocks,
         )
         .unwrap_or(0) as i64;
+        // The `models.num_heads` column predates per-block schedules and is
+        // a single INTEGER, so a non-uniform schedule can't be stored
+        // directly there. Store the minimum entry (equal to the common
+        // value when uniform) as the least-misleading single-number
+        // summary, and put the actual per-block schedule + reload flag in
+        // `note` (see `generate_note`'s doc).
+        let representative_num_heads = meta.heads_schedule.iter().copied().min().unwrap_or(0) as i64;
         let note = generate_note(
             model_type_str,
             params_estimate,
             meta.block_size as i64,
             meta.hidden_size as i64,
-            meta.num_heads as i64,
+            representative_num_heads,
             meta.num_blocks as i64,
             tokenizer_str,
             outcome.epochs_run,
             &dataset_filename,
             meta.seed,
             outcome.early_stopped,
+            meta.heads_schedule,
         );
         let (eval_min, eval_max) = resolve_eval_range(meta);
         let now = now_unix();
@@ -835,8 +1422,16 @@ impl ModelRecord {
             vocab_size: meta.actual_vocab_size as i64,
             block_size: meta.block_size as i64,
             hidden_size: meta.hidden_size as i64,
-            num_heads: meta.num_heads as i64,
+            num_heads: representative_num_heads,
             num_blocks: meta.num_blocks as i64,
+            // Lossless per-block schedule (CSV, same syntax `--num-heads`
+            // accepts) — the source of truth for reloading this model's
+            // exact architecture, unlike `num_heads` above.
+            heads_schedule: heads_schedule_to_csv(meta.heads_schedule),
+            // A live `--train`/`--rft`/`--grpo` run always knows the actual
+            // CLI flag value used for this model's SFT stage (`with_variant`
+            // copies it from the base's meta for RL variants).
+            aligned_windows: Some(meta.aligned_windows),
             dataset,
             dataset_name,
             eval_min,
@@ -877,9 +1472,10 @@ pub fn resolve_eval_range(meta: &TrainingMeta) -> (i64, i64) {
 // --- Free helpers ---
 
 /// `rusqlite` row → `ModelRecord` mapper, shared by `list_models` and
-/// `get_model` to avoid repeating the 19-column `get` list. `base_model_id`
+/// `get_model` to avoid repeating the 20-column `get` list. `base_model_id`
 /// is nullable — rows written before the migration (or base models) come back
-/// as `None`.
+/// as `None`. `heads_schedule` defaults to `''` (never NULL — see the
+/// migration's doc) for rows written before that column existed.
 fn map_model_row(row: &Row) -> rusqlite::Result<ModelRecord> {
     Ok(ModelRecord {
         id: row.get(0)?,
@@ -891,16 +1487,18 @@ fn map_model_row(row: &Row) -> rusqlite::Result<ModelRecord> {
         hidden_size: row.get(6)?,
         num_heads: row.get(7)?,
         num_blocks: row.get(8)?,
-        dataset: row.get(9)?,
-        dataset_name: row.get(10)?,
-        eval_min: row.get(11)?,
-        eval_max: row.get(12)?,
-        eval_samples: row.get(13)?,
-        note: row.get(14)?,
-        params_estimate: row.get(15)?,
-        base_model_id: row.get(16)?,
-        created_at: row.get(17)?,
-        updated_at: row.get(18)?,
+        heads_schedule: row.get(9)?,
+        aligned_windows: row.get(10)?,
+        dataset: row.get(11)?,
+        dataset_name: row.get(12)?,
+        eval_min: row.get(13)?,
+        eval_max: row.get(14)?,
+        eval_samples: row.get(15)?,
+        note: row.get(16)?,
+        params_estimate: row.get(17)?,
+        base_model_id: row.get(18)?,
+        created_at: row.get(19)?,
+        updated_at: row.get(20)?,
     })
 }
 
@@ -921,6 +1519,51 @@ fn map_eval_row(row: &Row) -> rusqlite::Result<EvalRecord> {
         eval_min: row.get(9)?,
         eval_max: row.get(10)?,
         run_at: row.get(11)?,
+    })
+}
+
+/// `rusqlite` row → `EvalGridRecord` mapper for `latest_eval_grid`.
+fn map_eval_grid_row(row: &Row) -> rusqlite::Result<EvalGridRecord> {
+    Ok(EvalGridRecord {
+        model_id: row.get(0)?,
+        eval_min: row.get(1)?,
+        eval_max: row.get(2)?,
+        report_json: row.get(3)?,
+        correct: row.get(4)?,
+        total: row.get(5)?,
+        run_at: row.get(6)?,
+    })
+}
+
+/// `rusqlite` row → `JacobianLensRecord` mapper for `latest_jacobian_lens`.
+/// `plot_files` is stored as a JSON array string; a parse failure degrades to
+/// an empty Vec (logged by the caller if it wants) rather than failing the
+/// whole row read.
+fn map_jacobian_lens_row(row: &Row) -> rusqlite::Result<JacobianLensRecord> {
+    let plot_files_json: String = row.get(3)?;
+    let plot_files: Vec<String> = serde_json::from_str(&plot_files_json).unwrap_or_default();
+    Ok(JacobianLensRecord {
+        model_id: row.get(0)?,
+        results_json: row.get(1)?,
+        plot_dir: row.get(2)?,
+        plot_files,
+        computed_at: row.get(4)?,
+    })
+}
+
+/// `rusqlite` row → `CheckpointGridRecord` mapper for `list_checkpoint_grids`.
+fn map_checkpoint_grid_row(row: &Row) -> rusqlite::Result<CheckpointGridRecord> {
+    Ok(CheckpointGridRecord {
+        id: row.get(0)?,
+        model_id: row.get(1)?,
+        epoch: row.get(2)?,
+        loss: row.get(3)?,
+        eval_min: row.get(4)?,
+        eval_max: row.get(5)?,
+        report_json: row.get(6)?,
+        correct: row.get(7)?,
+        total: row.get(8)?,
+        run_at: row.get(9)?,
     })
 }
 
@@ -952,6 +1595,138 @@ fn migrate_add_eval_range_columns(conn: &Connection) -> SmolResult<()> {
     if !existing.contains("eval_max") {
         conn.execute_batch("ALTER TABLE evals ADD COLUMN eval_max INTEGER")
             .map_err(|e| SmolError::custom_error(&format!("migrate: add eval_max: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Idempotent in-place migration: add `train_correct`/`train_total` to the
+/// `trainings` table. Checks `PRAGMA table_info(trainings)` first and only
+/// ALTERs whichever column is missing, so re-running on an already-migrated
+/// DB is a no-op.
+fn migrate_add_train_accuracy_columns(conn: &Connection) -> SmolResult<()> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(trainings)")
+        .map_err(|e| SmolError::custom_error(&format!("migrate train_accuracy: table_info: {e}")))?;
+    let rows = stmt
+        .query_map([], |row| {
+            let name: String = row.get(1)?;
+            Ok(name)
+        })
+        .map_err(|e| SmolError::custom_error(&format!("migrate train_accuracy: query: {e}")))?;
+    let mut existing = std::collections::HashSet::new();
+    for r in rows {
+        let name = r.map_err(|e| SmolError::custom_error(&format!("migrate train_accuracy: row: {e}")))?;
+        existing.insert(name);
+    }
+    if !existing.contains("train_correct") {
+        conn.execute_batch("ALTER TABLE trainings ADD COLUMN train_correct INTEGER")
+            .map_err(|e| SmolError::custom_error(&format!("migrate train_accuracy: add train_correct: {e}")))?;
+    }
+    if !existing.contains("train_total") {
+        conn.execute_batch("ALTER TABLE trainings ADD COLUMN train_total INTEGER")
+            .map_err(|e| SmolError::custom_error(&format!("migrate train_accuracy: add train_total: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Idempotent in-place migration: add `heads_schedule` to the `models`
+/// table — the lossless per-block head-count schedule (CSV string, same
+/// syntax `--num-heads` accepts). `ALTER TABLE ADD COLUMN ... DEFAULT ''`
+/// backfills existing rows with an empty string rather than NULL, so
+/// `ModelRecord.heads_schedule` can stay a plain `String` (no `Option`
+/// needed) — callers that need a schedule for an empty-string row should
+/// fall back to treating `num_heads` as uniform (`vec![num_heads;
+/// num_blocks]`), which is correct for every pre-migration row except the
+/// one non-uniform experiment (`mask-test-4blocks-heads-1-1-4-4`) registered
+/// before this column existed; that row is re-registered by the training
+/// experiment that introduced it (see `train.rs`), not backfilled here,
+/// since its true schedule was never stored anywhere structured to backfill
+/// FROM. Checks `PRAGMA table_info(models)` first so re-running on an
+/// already-migrated DB is a no-op.
+fn migrate_add_heads_schedule_column(conn: &Connection) -> SmolResult<()> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(models)")
+        .map_err(|e| SmolError::custom_error(&format!("migrate heads_schedule: table_info: {e}")))?;
+    let rows = stmt
+        .query_map([], |row| {
+            let name: String = row.get(1)?;
+            Ok(name)
+        })
+        .map_err(|e| SmolError::custom_error(&format!("migrate heads_schedule: query: {e}")))?;
+    let mut existing = std::collections::HashSet::new();
+    for r in rows {
+        let name = r.map_err(|e| SmolError::custom_error(&format!("migrate heads_schedule: row: {e}")))?;
+        existing.insert(name);
+    }
+    if !existing.contains("heads_schedule") {
+        conn.execute_batch("ALTER TABLE models ADD COLUMN heads_schedule TEXT NOT NULL DEFAULT ''")
+            .map_err(|e| SmolError::custom_error(&format!("migrate heads_schedule: add column: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Idempotent in-place migration: add `aligned_windows` to the `models`
+/// table -- whether this model's SFT stage sampled training windows only
+/// from true fact boundaries (`--aligned-windows`; see
+/// `ModelRecord.aligned_windows`'s doc). SQLite's `ALTER TABLE ADD COLUMN`
+/// leaves existing rows NULL (unknown historical setting, since this flag was
+/// never tracked before this migration) rather than a guessed default.
+/// Checks `PRAGMA table_info(models)` first so re-running on an
+/// already-migrated DB is a no-op.
+fn migrate_add_aligned_windows_column(conn: &Connection) -> SmolResult<()> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(models)")
+        .map_err(|e| SmolError::custom_error(&format!("migrate aligned_windows: table_info: {e}")))?;
+    let rows = stmt
+        .query_map([], |row| {
+            let name: String = row.get(1)?;
+            Ok(name)
+        })
+        .map_err(|e| SmolError::custom_error(&format!("migrate aligned_windows: query: {e}")))?;
+    let mut existing = std::collections::HashSet::new();
+    for r in rows {
+        let name = r.map_err(|e| SmolError::custom_error(&format!("migrate aligned_windows: row: {e}")))?;
+        existing.insert(name);
+    }
+    if !existing.contains("aligned_windows") {
+        conn.execute_batch("ALTER TABLE models ADD COLUMN aligned_windows INTEGER")
+            .map_err(|e| SmolError::custom_error(&format!("migrate aligned_windows: add column: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Idempotent in-place migration: add `prompt_min`/`prompt_max`/`prompt_ops`
+/// to the `trainings` table -- the operand range + ops an RFT/GRPO row's RL
+/// stage actually sampled prompts from (see `TrainingRecord`'s doc). Existing
+/// rows get NULL (unknown -- pre-migration RFT/GRPO runs, and every SFT row,
+/// which has no prompt-sampling concept). Checks `PRAGMA table_info(trainings)`
+/// first so re-running on an already-migrated DB is a no-op.
+fn migrate_add_prompt_range_columns(conn: &Connection) -> SmolResult<()> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(trainings)")
+        .map_err(|e| SmolError::custom_error(&format!("migrate prompt_range: table_info: {e}")))?;
+    let rows = stmt
+        .query_map([], |row| {
+            let name: String = row.get(1)?;
+            Ok(name)
+        })
+        .map_err(|e| SmolError::custom_error(&format!("migrate prompt_range: query: {e}")))?;
+    let mut existing = std::collections::HashSet::new();
+    for r in rows {
+        let name = r.map_err(|e| SmolError::custom_error(&format!("migrate prompt_range: row: {e}")))?;
+        existing.insert(name);
+    }
+    if !existing.contains("prompt_min") {
+        conn.execute_batch("ALTER TABLE trainings ADD COLUMN prompt_min INTEGER")
+            .map_err(|e| SmolError::custom_error(&format!("migrate prompt_range: add prompt_min: {e}")))?;
+    }
+    if !existing.contains("prompt_max") {
+        conn.execute_batch("ALTER TABLE trainings ADD COLUMN prompt_max INTEGER")
+            .map_err(|e| SmolError::custom_error(&format!("migrate prompt_range: add prompt_max: {e}")))?;
+    }
+    if !existing.contains("prompt_ops") {
+        conn.execute_batch("ALTER TABLE trainings ADD COLUMN prompt_ops TEXT")
+            .map_err(|e| SmolError::custom_error(&format!("migrate prompt_range: add prompt_ops: {e}")))?;
     }
     Ok(())
 }
@@ -1085,7 +1860,12 @@ fn map_training_row(row: &Row) -> rusqlite::Result<TrainingRecord> {
         final_loss: row.get(5)?,
         loss_trajectory_json: row.get(6)?,
         rft_summary_json: row.get(7)?,
-        trained_at: row.get(8)?,
+        train_correct: row.get(8)?,
+        train_total: row.get(9)?,
+        prompt_min: row.get(10)?,
+        prompt_max: row.get(11)?,
+        prompt_ops: row.get(12)?,
+        trained_at: row.get(13)?,
     })
 }
 
@@ -1130,6 +1910,16 @@ pub fn estimate_params(
 ) -> Option<usize> {
     Some(match model_type {
         "bigram" => vocab_size * vocab_size,
+        // `block_size` stores NgramLM's context length (N - 1) — see
+        // `train.rs`'s `--ngram-order` override. Params = the embedding
+        // table's row*col count: vocab_size^(N-1) rows * vocab_size cols =
+        // vocab_size^N. `checked_pow` guards against overflow for a
+        // pathologically large N/vocab combination (falls back to
+        // `usize::MAX` rather than panicking).
+        "ngram" => {
+            let n = (block_size + 1) as u32;
+            vocab_size.checked_pow(n).unwrap_or(usize::MAX)
+        }
         "gpt" => {
             let h = hidden_size;
             let b = block_size;
@@ -1172,17 +1962,66 @@ fn actual_vocab_for_entry(entry: &ModelEntry, project_root: &Path) -> Option<usi
     }
 }
 
+/// Format a per-block head-count schedule as the comma-separated string
+/// `--num-heads` already accepts (e.g. `[1, 1, 4, 4]` -> `"1,1,4,4"`), so the
+/// value stored in `models.heads_schedule` round-trips directly into a
+/// `--num-heads` CLI value / `resolve_heads_schedule` input. Shared by
+/// `generate_note` (the human-readable reload hint) and
+/// `ModelRecord::from_training` (the lossless DB column).
+fn heads_schedule_to_csv(heads_schedule: &[usize]) -> String {
+    heads_schedule
+        .iter()
+        .map(|h| h.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Parse a `ModelRecord`'s stored `heads_schedule` CSV column back into a
+/// per-block `Vec<usize>`, with a graceful fallback for rows written before
+/// the column existed (or a malformed value): treat `num_heads` as a
+/// uniform schedule (`vec![num_heads; num_blocks]`) — correct for every
+/// pre-migration row (they were all uniform architectures; per-block
+/// schedules didn't exist yet), and the same "best guess" the CLI itself
+/// falls back to for a bare `--num-heads N`. Used by `--serve`'s model-load
+/// endpoints so they reconstruct the ACTUAL per-block shapes for a
+/// non-uniform model instead of a lossy uniform approximation derived from
+/// `num_heads` alone.
+pub fn parse_heads_schedule_column(heads_schedule: &str, num_heads: i64, num_blocks: i64) -> Vec<usize> {
+    let uniform_fallback = || vec![num_heads.max(0) as usize; num_blocks.max(0) as usize];
+    if heads_schedule.trim().is_empty() {
+        return uniform_fallback();
+    }
+    let parsed: Result<Vec<usize>, _> = heads_schedule
+        .split(',')
+        .map(|part| part.trim().parse::<usize>())
+        .collect();
+    match parsed {
+        Ok(v) if !v.is_empty() => v,
+        _ => uniform_fallback(),
+    }
+}
+
 /// Auto-generate the model `note` from training metadata + outcome. Format:
 ///
 /// ```text
 /// {model_type} {params}K params (block={b} hidden={h} heads={nh} blocks={nb}),
 /// {tokenizer} tokenizer, trained {epochs_run} epochs on {dataset_filename},
-/// seed {seed}{early_stop_clause}
+/// seed {seed}{early_stop_clause}{heads_schedule_clause}
 /// ```
 ///
 /// where `early_stop_clause` = `, early-stopped at epoch {epochs_run}` if early
 /// stopping fired, else empty. `{params}` rounds to whole K for >=10K models
 /// and one decimal place for smaller ones (so 77582 → "78K", 7300 → "7.3K").
+///
+/// `heads={nh}` in the summary line is always the single representative value
+/// (`min(heads_schedule)`, passed in as `num_heads` — matches the `models`
+/// table's scalar column, which predates per-block schedules). For a
+/// NON-uniform `heads_schedule` (i.e. not every block has the same head
+/// count), `heads_schedule_clause` appends the exact per-block schedule and
+/// the `--num-heads` value needed to reload this exact model, e.g.
+/// `, heads-schedule=[1,2,4,8] (reload with --num-heads "1,2,4,8")` — a
+/// uniform architecture already round-trips via the bare `heads={nh}` in the
+/// summary, so the clause is omitted (empty) in that case.
 fn generate_note(
     model_type: &str,
     params_estimate: i64,
@@ -1195,6 +2034,7 @@ fn generate_note(
     dataset_filename: &str,
     seed: Option<u64>,
     early_stopped: bool,
+    heads_schedule: &[usize],
 ) -> String {
     let params_k = if params_estimate >= 10_000 {
         format!("{:.0}K", params_estimate as f64 / 1000.0)
@@ -1210,8 +2050,17 @@ fn generate_note(
     } else {
         String::new()
     };
+    let is_uniform = heads_schedule.windows(2).all(|w| w[0] == w[1]);
+    let heads_schedule_clause = if heads_schedule.is_empty() || is_uniform {
+        String::new()
+    } else {
+        let schedule_str = heads_schedule_to_csv(heads_schedule);
+        format!(
+            ", heads-schedule=[{schedule_str}] (reload with --num-heads \"{schedule_str}\")"
+        )
+    };
     format!(
-        "{model_type} {params_k} params (block={block_size} hidden={hidden_size} heads={num_heads} blocks={num_blocks}), {tokenizer} tokenizer, trained {epochs_run} epochs on {dataset}, seed {seed}{early_clause}",
+        "{model_type} {params_k} params (block={block_size} hidden={hidden_size} heads={num_heads} blocks={num_blocks}), {tokenizer} tokenizer, trained {epochs_run} epochs on {dataset}, seed {seed}{early_clause}{heads_schedule_clause}",
         model_type = model_type,
         params_k = params_k,
         block_size = block_size,
@@ -1223,6 +2072,7 @@ fn generate_note(
         dataset = dataset_filename,
         seed = seed_str,
         early_clause = early_clause,
+        heads_schedule_clause = heads_schedule_clause,
     )
 }
 
@@ -1351,6 +2201,7 @@ mod tests {
             "arithmetic-1digit.txt",
             Some(42),
             false,
+            &[8, 8, 8, 8, 8, 8],
         );
         assert!(note.contains("gpt 78K params"));
         assert!(note.contains("block=32 hidden=32 heads=8 blocks=6"));
@@ -1358,6 +2209,9 @@ mod tests {
         assert!(note.contains("trained 2000 epochs on arithmetic-1digit.txt"));
         assert!(note.contains("seed 42"));
         assert!(!note.contains("early-stopped"));
+        // Uniform schedule -> no heads-schedule clause (the bare `heads=8`
+        // above already fully describes the architecture).
+        assert!(!note.contains("heads-schedule"));
     }
 
     #[test]
@@ -1374,10 +2228,36 @@ mod tests {
             "arithmetic.txt",
             None,
             true,
+            &[4, 4],
         );
         assert!(note.contains("gpt 7.3K params"));
         assert!(note.contains("seed random"));
         assert!(note.contains("early-stopped at epoch 430"));
+    }
+
+    /// A non-uniform `heads_schedule` must append the exact per-block
+    /// schedule and the `--num-heads` value needed to reload this model —
+    /// this is the ONLY place (short of re-running with the same flags) a
+    /// user can recover the schedule, since the `models.num_heads` DB column
+    /// only stores a single representative (min) value.
+    #[test]
+    fn test_generate_note_non_uniform_schedule_appends_reload_hint() {
+        let note = generate_note(
+            "gpt",
+            7300,
+            16,
+            16,
+            1, // representative (min) value stored in the DB column
+            4,
+            "char",
+            4000,
+            "arithmetic-add-1digit.txt",
+            Some(42),
+            false,
+            &[1, 1, 4, 4],
+        );
+        assert!(note.contains("heads-schedule=[1,1,4,4]"));
+        assert!(note.contains("reload with --num-heads \"1,1,4,4\""));
     }
 
     #[test]
@@ -1398,6 +2278,8 @@ mod tests {
             hidden_size: 16,
             num_heads: 4,
             num_blocks: 2,
+            heads_schedule: "4,4".to_string(),
+            aligned_windows: None,
             dataset: "data/arithmetic.txt".to_string(),
             dataset_name: "arithmetic".to_string(),
             eval_min: 0,
@@ -1448,6 +2330,8 @@ mod tests {
             hidden_size: 16,
             num_heads: 4,
             num_blocks: 2,
+            heads_schedule: "4,4".to_string(),
+            aligned_windows: None,
             dataset: "data/arithmetic.txt".to_string(),
             dataset_name: "arithmetic".to_string(),
             eval_min: 0,
@@ -1514,6 +2398,8 @@ mod tests {
             hidden_size: 16,
             num_heads: 4,
             num_blocks: 2,
+            heads_schedule: "4,4".to_string(),
+            aligned_windows: None,
             dataset: "data/arithmetic.txt".to_string(),
             dataset_name: "arithmetic".to_string(),
             eval_min: 0,
@@ -1569,6 +2455,11 @@ mod tests {
             1.238,
             &loss_json,
             "null",
+            Some(42),
+            Some(55),
+            None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -1580,6 +2471,11 @@ mod tests {
         assert!((t.final_loss - 1.238).abs() < 1e-6);
         assert_eq!(t.loss_trajectory_json, loss_json);
         assert_eq!(t.rft_summary_json, "null");
+        assert_eq!(t.train_correct, Some(42));
+        assert_eq!(t.train_total, Some(55));
+        assert_eq!(t.prompt_min, None);
+        assert_eq!(t.prompt_max, None);
+        assert_eq!(t.prompt_ops, None);
 
         // Round-trip the loss JSON.
         let parsed: Vec<f32> =
@@ -1611,6 +2507,11 @@ mod tests {
             0.0,
             "null",
             &summary_json,
+            None,
+            None,
+            Some(0),
+            Some(999),
+            Some("+,-"),
         )
         .unwrap();
 
@@ -1622,6 +2523,10 @@ mod tests {
         let parsed: RftSummary =
             serde_json::from_str(&t.rft_summary_json).unwrap();
         assert_eq!(parsed, summary);
+        // Round-trip the RL-stage prompt-sampling range/ops.
+        assert_eq!(t.prompt_min, Some(0));
+        assert_eq!(t.prompt_max, Some(999));
+        assert_eq!(t.prompt_ops.as_deref(), Some("+,-"));
     }
 
     #[test]
@@ -1633,13 +2538,13 @@ mod tests {
         // Two trainings for the same model. The second insert happens later in
         // wall-clock time (trained_at is the order key), so latest_training
         // must return it.
-        reg.upsert_training("m", "sft", 100, false, 5.0, "[5.0]", "null")
+        reg.upsert_training("m", "sft", 100, false, 5.0, "[5.0]", "null", None, None, None, None, None)
             .unwrap();
         // Tiny sleep so `now_unix()` advances by at least 1 second, making the
         // second row strictly newer. (If both rows share the same second, the
         // tie-breaker on `id DESC` still picks the second row.)
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        reg.upsert_training("m", "sft", 200, true, 1.2, "[1.2]", "null")
+        reg.upsert_training("m", "sft", 200, true, 1.2, "[1.2]", "null", None, None, None, None, None)
             .unwrap();
 
         let t = reg.latest_training("m").unwrap().unwrap();
@@ -1663,6 +2568,8 @@ mod tests {
             hidden_size: 16,
             num_heads: 4,
             num_blocks: 2,
+            heads_schedule: "4,4".to_string(),
+            aligned_windows: None,
             dataset: "data/arithmetic.txt".to_string(),
             dataset_name: "arithmetic".to_string(),
             eval_min: lo,
@@ -1796,6 +2703,148 @@ mod tests {
     }
 
     #[test]
+    fn test_record_and_latest_eval_grid_round_trip() {
+        let dir = temp_dir::TempDir::new().unwrap();
+        let db = dir.path().join("test.db");
+        let reg = Registry::open_at(&db).unwrap();
+        register_model_with_range(&reg, "m", 0, 9);
+
+        assert!(reg.latest_eval_grid("m").unwrap().is_none());
+
+        let report_json = r#"{"min":0,"max":9,"grids":[],"correct":12,"total":100}"#;
+        reg.record_eval_grid("m", 0, 9, report_json, 12, 100)
+            .unwrap();
+
+        let cached = reg.latest_eval_grid("m").unwrap().unwrap();
+        assert_eq!(cached.model_id, "m");
+        assert_eq!(cached.eval_min, 0);
+        assert_eq!(cached.eval_max, 9);
+        assert_eq!(cached.correct, 12);
+        assert_eq!(cached.total, 100);
+        assert_eq!(cached.report_json, report_json);
+    }
+
+    #[test]
+    fn test_record_and_latest_jacobian_lens_round_trip() {
+        let dir = temp_dir::TempDir::new().unwrap();
+        let db = dir.path().join("test.db");
+        let reg = Registry::open_at(&db).unwrap();
+        register_model_with_range(&reg, "m", 0, 9);
+
+        assert!(reg.latest_jacobian_lens("m").unwrap().is_none());
+
+        let results_json = r#"{"greedy_accuracy":0.9,"n_facts":55}"#;
+        let plot_files = vec!["layer_accuracy.png".to_string(), "group_rank.png".to_string()];
+        reg.record_jacobian_lens("m", results_json, "jacobian_lens_output/m", &plot_files)
+            .unwrap();
+
+        let cached = reg.latest_jacobian_lens("m").unwrap().unwrap();
+        assert_eq!(cached.model_id, "m");
+        assert_eq!(cached.results_json, results_json);
+        assert_eq!(cached.plot_dir, "jacobian_lens_output/m");
+        assert_eq!(cached.plot_files, plot_files);
+    }
+
+    #[test]
+    fn test_record_jacobian_lens_overwrites_in_place_not_history() {
+        // Same "single row per model, overwritten on recompute" contract as
+        // `eval_grids` — a second `record_jacobian_lens` call for the same
+        // model must overwrite, not add a second row.
+        let dir = temp_dir::TempDir::new().unwrap();
+        let db = dir.path().join("test.db");
+        let reg = Registry::open_at(&db).unwrap();
+        register_model_with_range(&reg, "m", 0, 9);
+
+        reg.record_jacobian_lens("m", "{\"first\":true}", "dir1", &[])
+            .unwrap();
+        reg.record_jacobian_lens("m", "{\"second\":true}", "dir2", &["a.png".to_string()])
+            .unwrap();
+
+        let count: i64 = reg
+            .conn
+            .query_row("SELECT COUNT(*) FROM jacobian_lens_results WHERE model_id = 'm'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "jacobian_lens_results should hold exactly one row per model");
+
+        let cached = reg.latest_jacobian_lens("m").unwrap().unwrap();
+        assert_eq!(cached.results_json, "{\"second\":true}");
+        assert_eq!(cached.plot_dir, "dir2");
+        assert_eq!(cached.plot_files, vec!["a.png".to_string()]);
+    }
+
+    #[test]
+    fn test_latest_jacobian_lens_unregistered_model_returns_none() {
+        let dir = temp_dir::TempDir::new().unwrap();
+        let db = dir.path().join("test.db");
+        let reg = Registry::open_at(&db).unwrap();
+        assert!(reg.latest_jacobian_lens("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_record_eval_grid_overwrites_in_place_not_history() {
+        // Unlike `evals` (append-only history), `eval_grids` keeps only the
+        // latest row per model — a second `record_eval_grid` call for the
+        // same model must overwrite, not add a second row.
+        let dir = temp_dir::TempDir::new().unwrap();
+        let db = dir.path().join("test.db");
+        let reg = Registry::open_at(&db).unwrap();
+        register_model_with_range(&reg, "m", 0, 9);
+
+        reg.record_eval_grid("m", 0, 9, "{\"first\":true}", 1, 100)
+            .unwrap();
+        reg.record_eval_grid("m", 0, 9, "{\"second\":true}", 2, 100)
+            .unwrap();
+
+        let count: i64 = reg
+            .conn
+            .query_row("SELECT COUNT(*) FROM eval_grids WHERE model_id = 'm'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "eval_grids should hold exactly one row per model");
+
+        let cached = reg.latest_eval_grid("m").unwrap().unwrap();
+        assert_eq!(cached.correct, 2);
+        assert_eq!(cached.report_json, "{\"second\":true}");
+    }
+
+    #[test]
+    fn test_latest_eval_grid_hides_stale_range_cache() {
+        let dir = temp_dir::TempDir::new().unwrap();
+        let db = dir.path().join("test.db");
+        let reg = Registry::open_at(&db).unwrap();
+
+        // Cache a grid computed for the OLD range (0..9).
+        register_model_with_range(&reg, "m", 0, 9);
+        reg.record_eval_grid("m", 0, 9, "{\"stale\":true}", 5, 100)
+            .unwrap();
+
+        // Now the model's configured range changes to 0..19 — the cached
+        // grid (computed for 0..9) must be treated as absent, not served
+        // stale, exactly like `latest_eval`'s smart-mode range filter.
+        register_model_with_range(&reg, "m", 0, 19);
+        assert!(
+            reg.latest_eval_grid("m").unwrap().is_none(),
+            "latest_eval_grid must hide a cache stamped with a superseded range"
+        );
+
+        // A fresh grid recomputed for the new range replaces the cache (still
+        // one row) and is now visible.
+        reg.record_eval_grid("m", 0, 19, "{\"fresh\":true}", 40, 400)
+            .unwrap();
+        let cached = reg.latest_eval_grid("m").unwrap().unwrap();
+        assert_eq!(cached.eval_min, 0);
+        assert_eq!(cached.eval_max, 19);
+        assert_eq!(cached.correct, 40);
+    }
+
+    #[test]
+    fn test_latest_eval_grid_unregistered_model_returns_none() {
+        let dir = temp_dir::TempDir::new().unwrap();
+        let db = dir.path().join("test.db");
+        let reg = Registry::open_at(&db).unwrap();
+        assert!(reg.latest_eval_grid("nope").unwrap().is_none());
+    }
+
+    #[test]
     fn test_resolve_eval_range_user_override_wins() {
         // User explicitly passes both flags → use those, regardless of mode.
         let dir = temp_dir::TempDir::new().unwrap();
@@ -1809,8 +2858,9 @@ mod tests {
             tokenizer: TokenizerType::Char,
             block_size: 16,
             hidden_size: 16,
-            num_heads: 4,
+            heads_schedule: &[4, 4],
             num_blocks: 2,
+            aligned_windows: false,
             dataset_path: &corpus_path,
             model_path: &model_path,
             actual_vocab_size: 14,
@@ -1837,8 +2887,9 @@ mod tests {
             tokenizer: TokenizerType::Char,
             block_size: 16,
             hidden_size: 16,
-            num_heads: 4,
+            heads_schedule: &[4, 4],
             num_blocks: 2,
+            aligned_windows: false,
             dataset_path: &corpus_path,
             model_path: &model_path,
             actual_vocab_size: 14,
@@ -1866,8 +2917,9 @@ mod tests {
             tokenizer: TokenizerType::Char,
             block_size: 16,
             hidden_size: 16,
-            num_heads: 4,
+            heads_schedule: &[4, 4],
             num_blocks: 2,
+            aligned_windows: false,
             dataset_path: &corpus_path,
             model_path: &model_path,
             actual_vocab_size: 14,
@@ -1893,8 +2945,9 @@ mod tests {
             tokenizer: TokenizerType::Char,
             block_size: 16,
             hidden_size: 16,
-            num_heads: 4,
+            heads_schedule: &[4, 4],
             num_blocks: 2,
+            aligned_windows: false,
             dataset_path: &corpus_path,
             model_path: &model_path,
             actual_vocab_size: 14,
@@ -1922,8 +2975,9 @@ mod tests {
             tokenizer: TokenizerType::Char,
             block_size: 16,
             hidden_size: 16,
-            num_heads: 4,
+            heads_schedule: &[4, 4],
             num_blocks: 2,
+            aligned_windows: false,
             dataset_path: &corpus_path,
             model_path: &model_path,
             actual_vocab_size: 14,
@@ -1967,9 +3021,9 @@ mod tests {
         let db = dir.path().join("test.db");
         let reg = Registry::open_at(&db).unwrap();
 
-        reg.upsert_training("m", "sft", 10, false, 5.0, "[5.0, 4.8]", "null")
+        reg.upsert_training("m", "sft", 10, false, 5.0, "[5.0, 4.8]", "null", None, None, None, None, None)
             .unwrap();
-        reg.upsert_training("m", "sft", 20, false, 1.2, "[5.0, 4.8, 1.2]", "null")
+        reg.upsert_training("m", "sft", 20, false, 1.2, "[5.0, 4.8, 1.2]", "null", None, None, None, None, None)
             .unwrap();
 
         let t = reg.latest_training("m").unwrap().unwrap();
@@ -1997,9 +3051,9 @@ mod tests {
         let db = dir.path().join("test.db");
         let reg = Registry::open_at(&db).unwrap();
 
-        reg.upsert_training("m", "sft", 2000, false, 1.2, "[1.2]", "null")
+        reg.upsert_training("m", "sft", 2000, false, 1.2, "[1.2]", "null", None, None, None, None, None)
             .unwrap();
-        reg.upsert_training("m", "rft", 3, false, 0.5, "null", "{\"rounds\":3}")
+        reg.upsert_training("m", "rft", 3, false, 0.5, "null", "{\"rounds\":3}", None, None, None, None, None)
             .unwrap();
 
         // Two rows: one per kind.
@@ -2014,7 +3068,7 @@ mod tests {
         assert_eq!(count, 2, "distinct kinds must coexist as separate rows");
 
         // Upserting SFT again must not touch the RFT row.
-        reg.upsert_training("m", "sft", 4000, true, 0.9, "[0.9]", "null")
+        reg.upsert_training("m", "sft", 4000, true, 0.9, "[0.9]", "null", None, None, None, None, None)
             .unwrap();
         let count: i64 = reg
             .conn
@@ -2076,6 +3130,139 @@ mod tests {
     }
 
     #[test]
+    fn test_heads_schedule_column_migration_is_idempotent() {
+        // Opening the same DB twice must not error on the second
+        // heads_schedule migration attempt, and a freshly-registered row's
+        // schedule must round-trip through the DB unchanged.
+        let dir = temp_dir::TempDir::new().unwrap();
+        let db = dir.path().join("test.db");
+        let _ = Registry::open_at(&db).unwrap();
+        // Second open re-runs migrate_add_heads_schedule_column — must succeed.
+        let reg = Registry::open_at(&db).unwrap();
+        register_model_with_range(&reg, "m", 0, 9);
+        let m = reg.get_model("m").unwrap().unwrap();
+        assert_eq!(m.heads_schedule, "4,4");
+    }
+
+    #[test]
+    fn test_aligned_windows_column_migration_is_idempotent() {
+        // Opening the same DB twice must not error on the second
+        // aligned_windows migration attempt. A row registered with an
+        // explicit Some(bool) round-trips; a row registered via the plain
+        // helper (which leaves aligned_windows unset) comes back None
+        // (unknown) -- mirroring a pre-existing row from before this column
+        // existed.
+        let dir = temp_dir::TempDir::new().unwrap();
+        let db = dir.path().join("test.db");
+        let _ = Registry::open_at(&db).unwrap();
+        // Second open re-runs migrate_add_aligned_windows_column — must succeed.
+        let reg = Registry::open_at(&db).unwrap();
+
+        register_model_with_range(&reg, "unknown-model", 0, 9);
+        let m = reg.get_model("unknown-model").unwrap().unwrap();
+        assert_eq!(m.aligned_windows, None);
+
+        let now = now_unix();
+        let mut aligned_rec = ModelRecord {
+            id: "aligned-model".to_string(),
+            path: "aligned-model.bin".to_string(),
+            model_type: "gpt".to_string(),
+            tokenizer: "char".to_string(),
+            vocab_size: 14,
+            block_size: 16,
+            hidden_size: 16,
+            num_heads: 4,
+            num_blocks: 2,
+            heads_schedule: "4,4".to_string(),
+            aligned_windows: Some(true),
+            dataset: "data/arithmetic.txt".to_string(),
+            dataset_name: "arithmetic".to_string(),
+            eval_min: 0,
+            eval_max: 9,
+            eval_samples: 200,
+            note: "n".to_string(),
+            params_estimate: 7300,
+            base_model_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        reg.register_model(&aligned_rec).unwrap();
+        let m = reg.get_model("aligned-model").unwrap().unwrap();
+        assert_eq!(m.aligned_windows, Some(true));
+
+        aligned_rec.aligned_windows = Some(false);
+        reg.register_model(&aligned_rec).unwrap();
+        let m = reg.get_model("aligned-model").unwrap().unwrap();
+        assert_eq!(m.aligned_windows, Some(false));
+    }
+
+    #[test]
+    fn test_prompt_range_columns_migration_is_idempotent() {
+        // Opening the same DB twice must not error on the second prompt-range
+        // migration attempt, and a freshly-upserted row's prompt fields round-
+        // trip through the DB unchanged; an SFT row (which never sets these)
+        // stays NULL.
+        let dir = temp_dir::TempDir::new().unwrap();
+        let db = dir.path().join("test.db");
+        let _ = Registry::open_at(&db).unwrap();
+        // Second open re-runs migrate_add_prompt_range_columns — must succeed.
+        let reg = Registry::open_at(&db).unwrap();
+
+        reg.upsert_training("m", "sft", 10, false, 1.0, "[1.0]", "null", None, None, None, None, None)
+            .unwrap();
+        let t = reg.latest_training("m").unwrap().unwrap();
+        assert_eq!(t.prompt_min, None);
+        assert_eq!(t.prompt_max, None);
+        assert_eq!(t.prompt_ops, None);
+
+        reg.upsert_training(
+            "m2",
+            "grpo",
+            3,
+            false,
+            0.1,
+            "null",
+            "{\"rounds\":3}",
+            None,
+            None,
+            Some(10),
+            Some(500),
+            Some("+"),
+        )
+        .unwrap();
+        let t2 = reg.latest_training("m2").unwrap().unwrap();
+        assert_eq!(t2.prompt_min, Some(10));
+        assert_eq!(t2.prompt_max, Some(500));
+        assert_eq!(t2.prompt_ops.as_deref(), Some("+"));
+    }
+
+    #[test]
+    fn test_parse_heads_schedule_column_uses_stored_schedule() {
+        // A populated column wins outright, regardless of num_heads/num_blocks.
+        assert_eq!(
+            parse_heads_schedule_column("1,1,4,4", 1, 4),
+            vec![1, 1, 4, 4]
+        );
+        assert_eq!(parse_heads_schedule_column("4", 4, 1), vec![4]);
+    }
+
+    #[test]
+    fn test_parse_heads_schedule_column_falls_back_when_empty() {
+        // Empty column (pre-migration row) -> uniform fallback from
+        // num_heads/num_blocks.
+        assert_eq!(parse_heads_schedule_column("", 4, 2), vec![4, 4]);
+        assert_eq!(parse_heads_schedule_column("   ", 2, 3), vec![2, 2, 2]);
+    }
+
+    #[test]
+    fn test_parse_heads_schedule_column_falls_back_when_malformed() {
+        // Malformed/garbage column -> uniform fallback rather than a panic
+        // or an empty vec (a corrupted/hand-edited DB shouldn't crash the load).
+        assert_eq!(parse_heads_schedule_column("oops", 4, 2), vec![4, 4]);
+        assert_eq!(parse_heads_schedule_column("1,oops,4", 4, 2), vec![4, 4]);
+    }
+
+    #[test]
     fn test_register_and_read_back_base_model_id() {
         // Registering a variant with base_model_id=Some(base) round-trips
         // through the DB.
@@ -2098,6 +3285,8 @@ mod tests {
             hidden_size: 16,
             num_heads: 4,
             num_blocks: 2,
+            heads_schedule: "4,4".to_string(),
+            aligned_windows: None,
             dataset: "data/arithmetic.txt".to_string(),
             dataset_name: "arithmetic".to_string(),
             eval_min: 0,
@@ -2172,5 +3361,88 @@ mod tests {
             v.base_model_id, None,
             "backfill must skip variants whose stripped stem isn't registered"
         );
+    }
+
+    #[test]
+    fn test_checkpoint_grids_round_trip_ordered_by_epoch() {
+        let dir = temp_dir::TempDir::new().unwrap();
+        let db = dir.path().join("test.db");
+        let reg = Registry::open_at(&db).unwrap();
+        register_model_with_range(&reg, "cg-model", 0, 9);
+
+        // Empty history before any snapshot.
+        assert!(reg.list_checkpoint_grids("cg-model").unwrap().is_empty());
+
+        // Insert out of epoch order to confirm the query re-sorts by epoch.
+        reg.record_checkpoint_grid("cg-model", 100, 1.5, 0, 9, "{\"a\":1}", 10, 100)
+            .unwrap();
+        reg.record_checkpoint_grid("cg-model", 1, 5.0, 0, 9, "{\"a\":0}", 2, 100)
+            .unwrap();
+        reg.record_checkpoint_grid("cg-model", 50, 2.0, 0, 9, "{\"a\":2}", 6, 100)
+            .unwrap();
+
+        let rows = reg.list_checkpoint_grids("cg-model").unwrap();
+        assert_eq!(rows.len(), 3);
+        let epochs: Vec<i64> = rows.iter().map(|r| r.epoch).collect();
+        assert_eq!(epochs, vec![1, 50, 100], "rows must be ordered by epoch ASC");
+        assert_eq!(rows[0].loss, 5.0);
+        assert_eq!(rows[0].report_json, "{\"a\":0}");
+        assert_eq!(rows[2].correct, 10);
+        assert_eq!(rows[2].total, 100);
+
+        // A different model's history is independent.
+        register_model_with_range(&reg, "cg-model-2", 0, 9);
+        assert!(reg.list_checkpoint_grids("cg-model-2").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_checkpoint_grids_thin_when_over_cap() {
+        let dir = temp_dir::TempDir::new().unwrap();
+        let db = dir.path().join("test.db");
+        let reg = Registry::open_at(&db).unwrap();
+        register_model_with_range(&reg, "cg-cap-model", 0, 9);
+
+        // Insert well past MAX_CHECKPOINT_GRIDS_PER_MODEL (300) to force
+        // thinning to trigger at least once.
+        let total_inserted = 320;
+        for epoch in 1..=total_inserted {
+            reg.record_checkpoint_grid(
+                "cg-cap-model",
+                epoch,
+                1000.0 / epoch as f64,
+                0,
+                9,
+                "{}",
+                0,
+                100,
+            )
+            .unwrap();
+        }
+
+        let rows = reg.list_checkpoint_grids("cg-cap-model").unwrap();
+        assert!(
+            rows.len() <= 300,
+            "thinning must keep the row count at or under the cap, got {}",
+            rows.len()
+        );
+        assert!(
+            rows.len() > 150,
+            "uniform thinning must not over-delete (roughly halves, not more), got {}",
+            rows.len()
+        );
+        // Uniform thinning must always keep the first and last epoch, so the
+        // full training range stays representable for a UI slider.
+        assert_eq!(rows.first().unwrap().epoch, 1, "earliest epoch must survive thinning");
+        assert_eq!(
+            rows.last().unwrap().epoch,
+            total_inserted as i64,
+            "latest epoch must survive thinning"
+        );
+        // Still ordered by epoch.
+        let mut prev = 0;
+        for r in &rows {
+            assert!(r.epoch > prev, "rows must remain strictly increasing by epoch");
+            prev = r.epoch;
+        }
     }
 }

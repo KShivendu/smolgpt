@@ -9,3 +9,11 @@ smolgpt.db
 smolgpt.db-wal
 smolgpt.db-shm
 *.bak
+# Jacobian-lens analysis output (PNG plots written by analysis/jacobian_lens.py,
+# cached/served via the jacobian_lens_results DB table); regenerable via
+# --train --jacobian-lens or the --serve Jacobian/Embeddings tabs.
+jacobian_lens_output/
+# Python analysis: bytecode cache and regenerable plot/JSON output.
+__pycache__/
+*.pyc
+analysis/output/

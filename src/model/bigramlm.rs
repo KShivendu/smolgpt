@@ -36,6 +36,11 @@ impl BigramLM {
         Ok(())
     }
 
+    /// See `Gpt::save_quantized`'s doc / `crate::quantize`'s module doc.
+    pub fn save_quantized(&self, path: &PathBuf) -> SmolResult<()> {
+        crate::quantize::save_var_map_quantized(&self.var_map, path)
+    }
+
     pub fn load(
         path: &PathBuf,
         vocab_size: usize,
@@ -48,7 +53,7 @@ impl BigramLM {
             "embeddings",
             Init::Const(0.0),
         )?;
-        var_map.load(path)?;
+        crate::quantize::load_into_var_map(&mut var_map, path, device)?;
 
         let token_embedding = Embedding::new(embeddings, vocab_size);
 

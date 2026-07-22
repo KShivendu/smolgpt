@@ -45,13 +45,23 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
         grpo_clip_eps,
         grpo_kl_beta,
         grpo_epochs,
+        quantize,
+        jacobian_lens: run_jacobian_lens_flag,
         patience,
         min_delta,
+        no_dropout,
+        lr,
+        mask_loss,
+        aligned_windows,
+        init_std,
+        init_gain,
+        tie_embeddings,
         model_type,
         tokenizer: tokenizer_type,
         vocab_size: target_vocab_size,
         seed,
         block_size,
+        ngram_order,
         hidden_size,
         num_heads,
         num_blocks,
@@ -61,9 +71,21 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
         host,
     } = args;
 
-    if !train && !generate && !eval && !rft && !grpo && !serve {
+    // For `-m ngram`, `--ngram-order` (N) OVERRIDES `--block-size`: NgramLM's
+    // real, meaningful context length is `N - 1` (unlike BigramLM, which has
+    // no such concept), so `block_size` from here on IS that context length
+    // for every downstream use (model construction/load, the registry's
+    // `block_size` column, checkpoint-grid truncation, etc). Gpt/Bigram are
+    // unaffected.
+    let block_size = if matches!(model_type, crate::args::ModelType::Ngram) {
+        ngram_order.saturating_sub(1).max(1)
+    } else {
+        block_size
+    };
+
+    if !train && !generate && !eval && !rft && !grpo && !quantize && !serve {
         return Err(SmolError::invalid_argument(
-            "Either --train, --generate, --eval, --rft, --grpo, or --serve must be specified",
+            "Either --train, --generate, --eval, --rft, --grpo, --quantize, or --serve must be specified",
         ));
     }
 
@@ -111,6 +133,7 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
         match model_type {
             crate::args::ModelType::Gpt => format!("gpt-{suffix}.bin").into(),
             crate::args::ModelType::Bigram => format!("bigram-{suffix}.bin").into(),
+            crate::args::ModelType::Ngram => format!("ngram-{suffix}.bin").into(),
         }
     });
 
@@ -122,12 +145,13 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
     // (The tokenizer still needs the corpus *string* for vocab scanning, which
     // is why `corpus` is loaded unconditionally above.) `--serve` is handled
     // earlier and never reaches this point, so it isn't mentioned here.
-    let only_eval = eval && !train && !generate && !rft && !grpo;
-    let only_rft = rft && !train && !generate && !eval && !grpo;
-    let only_grpo = grpo && !train && !generate && !eval && !rft;
+    let only_eval = eval && !train && !generate && !rft && !grpo && !quantize;
+    let only_rft = rft && !train && !generate && !eval && !grpo && !quantize;
+    let only_grpo = grpo && !train && !generate && !eval && !rft && !quantize;
+    let only_quantize = quantize && !train && !generate && !eval && !rft && !grpo;
 
     let mut dataset: Option<Dataset> = None;
-    if !only_eval && !only_rft && !only_grpo {
+    if !only_eval && !only_rft && !only_grpo && !only_quantize {
         let encoded_corpus = tokenizer.encode(&corpus);
         let encoded_corpus_len = encoded_corpus.len();
         let data = Tensor::from_vec(encoded_corpus, Shape::from(encoded_corpus_len), &device)?;
@@ -136,7 +160,32 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
             data.shape(),
             data.dtype()
         );
-        dataset = Some(Dataset::with_rng(data, 0.9, rng.clone())?);
+        // EXPERIMENTAL: only build the answer mask when `--mask-loss` is
+        // requested and the tokenizer is char (1 token == 1 corpus char, the
+        // alignment `compute_answer_mask` assumes). BPE would misalign, so
+        // silently skip (train_with_dropout falls back to unmasked loss when
+        // no mask is present).
+        let answer_mask = if mask_loss && matches!(tokenizer_type, TokenizerType::Char) {
+            Some(dataset::compute_answer_mask(&corpus))
+        } else {
+            None
+        };
+        // EXPERIMENTAL (Hypothesis B): only meaningful for a char tokenizer
+        // (1 char == 1 token, same alignment assumption as `--mask-loss`'s
+        // answer mask); silently falls back to `None` (regular uniform
+        // sampling) otherwise.
+        let fact_boundaries = if aligned_windows && matches!(tokenizer_type, TokenizerType::Char) {
+            Some(dataset::compute_fact_boundaries(&corpus))
+        } else {
+            None
+        };
+        dataset = Some(Dataset::with_rng_and_mask_aligned(
+            data,
+            answer_mask,
+            fact_boundaries,
+            0.9,
+            rng.clone(),
+        )?);
     }
 
     let num_batches = num_batches;
@@ -146,10 +195,18 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
     // from a pretrained model — there's no point sampling completions from a
     // freshly initialized model. GRPO likewise needs a pretrained policy to
     // sample completions worth scoring.)
-    if (eval || rft || grpo) && !model_path.exists() {
+    if (eval || rft || grpo || quantize) && !model_path.exists() {
         return Err(SmolError::invalid_argument(&format!(
             "{} requires an existing model file at {}; train first",
-            if grpo { "--grpo" } else if rft { "--rft" } else { "--eval" },
+            if quantize {
+                "--quantize"
+            } else if grpo {
+                "--grpo"
+            } else if rft {
+                "--rft"
+            } else {
+                "--eval"
+            },
             model_path.display()
         )));
     }
@@ -162,8 +219,9 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
             block_size,
             vocab_size,
             hidden_size,
-            num_heads,
+            &num_heads,
             num_blocks,
+            tie_embeddings,
             &device,
         )?
     } else {
@@ -173,10 +231,27 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
             block_size,
             vocab_size,
             hidden_size,
-            num_heads,
+            &num_heads,
             num_blocks,
+            init_std,
+            init_gain,
+            tie_embeddings,
             &device,
         )?
+    };
+
+    // Resolve the raw `--num-heads` CLI value (single number or
+    // comma-separated per-block list) into the full per-block schedule, for
+    // the registry note / TrainingMeta below. The model construction above
+    // already validated this (via `Gpt::new`/`Gpt::load`), so this should
+    // never actually error here for a GPT model that just loaded/built
+    // successfully; BigramLM ignores num_heads entirely, so resolve against
+    // its own num_blocks (0) rather than the GPT one when applicable.
+    let heads_schedule_for_meta = match model_type {
+        crate::args::ModelType::Gpt => {
+            crate::model::resolve_heads_schedule(&num_heads, num_blocks)?
+        }
+        crate::args::ModelType::Bigram | crate::args::ModelType::Ngram => Vec::new(),
     };
 
     // Built once so both the --train (auto-register) and --eval (record_eval
@@ -190,8 +265,9 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
         tokenizer: tokenizer_type,
         block_size,
         hidden_size,
-        num_heads,
+        heads_schedule: &heads_schedule_for_meta,
         num_blocks,
+        aligned_windows,
         dataset_path: &dataset_path,
         model_path: &model_path,
         actual_vocab_size: vocab_size,
@@ -245,6 +321,89 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
             }
         };
 
+        // Resolve the grid's operand range once (same corpus-derivation rule
+        // `--eval` uses) so the checkpoint-grid snapshots and the final Grid
+        // tab cache describe the same range. Only enable snapshotting when
+        // the range fits `eval::MAX_GRID_AXIS` — a wider-range corpus would
+        // make each mid-training exhaustive grid expensive (and is out of
+        // scope here: this task's corpus is [0,9], comfortably 10x10).
+        let (grid_min, grid_max) = crate::registry::resolve_eval_range(&training_meta);
+        let grid_axis = grid_max - grid_min + 1;
+        let checkpoint_grids_enabled = grid_axis > 0 && grid_axis <= crate::eval::MAX_GRID_AXIS;
+        // Derive the grid's operators from the corpus itself (same fix as
+        // `--serve`'s eval endpoint) rather than trusting `--eval-ops`'s
+        // default ("+,-") — an addition-only corpus's char tokenizer has no
+        // `-` token at all, so grid cells sampled with `-` would silently
+        // mis-tokenize and either warn-and-corrupt or just be wrong, not
+        // reflect "the model hasn't learned subtraction" (it was never asked
+        // to).
+        let grid_ops = crate::dataset::operators_present(&corpus).unwrap_or_else(|| eval_ops.clone());
+        if !checkpoint_grids_enabled {
+            println!(
+                "[train] Checkpoint-grid snapshots disabled: operand range \
+                 [{grid_min},{grid_max}] ({grid_axis}x{grid_axis}) exceeds \
+                 MAX_GRID_AXIS={}; only the final Grid-tab cache (via --serve) \
+                 will be available for this model.",
+                crate::eval::MAX_GRID_AXIS
+            );
+        }
+
+        // on_best_loss closure: whenever `train_with_dropout` reports a new
+        // best-so-far smoothed loss (throttled — see `model::should_snapshot`),
+        // compute the exhaustive eval grid against the model's CURRENT
+        // (mid-training) weights and append it to the `checkpoint_grids`
+        // history so a follow-up UI can animate through it. Best-effort: any
+        // failure here only warns and never aborts training.
+        let mut on_best_loss = |epoch: usize, smoothed_loss: f32, m: &LanguageModel| {
+            if !checkpoint_grids_enabled {
+                return;
+            }
+            let (Some(reg), Some(id)) = (reg.as_ref().ok(), model_id_for_cb.as_ref()) else {
+                return;
+            };
+            match crate::eval::run_eval_grid(
+                m,
+                tokenizer.as_ref(),
+                &device,
+                grid_min,
+                grid_max,
+                block_size,
+                &grid_ops,
+            ) {
+                Ok(report) => {
+                    let correct = report.correct as i64;
+                    let total = report.total as i64;
+                    match serde_json::to_string(&report) {
+                        Ok(json) => {
+                            if let Err(e) = reg.record_checkpoint_grid(
+                                id,
+                                epoch,
+                                smoothed_loss as f64,
+                                grid_min,
+                                grid_max,
+                                &json,
+                                correct,
+                                total,
+                            ) {
+                                eprintln!(
+                                    "[train] WARNING: failed to record checkpoint grid at \
+                                     epoch {epoch} for {id} in smolgpt.db: {e}"
+                                );
+                            }
+                        }
+                        Err(e) => eprintln!(
+                            "[train] WARNING: failed to serialize checkpoint grid at \
+                             epoch {epoch} for {id}: {e}"
+                        ),
+                    }
+                }
+                Err(e) => eprintln!(
+                    "[train] WARNING: failed to compute checkpoint grid at epoch {epoch} \
+                     for {id}: {e}"
+                ),
+            }
+        };
+
         // on_checkpoint closure: upsert the partial loss trajectory into the
         // `trainings` table at each checkpoint save (every 10 epochs + final)
         // so the web UI shows live training progress. Borrows `&reg` (when
@@ -263,6 +422,10 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
                 );
                 "[]".to_string()
             });
+            // Intermediate checkpoint: no freshly-computed training accuracy
+            // (it's only computed once, after training finishes — see below).
+            // `None` here is safe: `upsert_training` COALESCEs against the
+            // previously-stored value rather than clobbering it with NULL.
             if let Err(e) = reg.upsert_training(
                 id,
                 "sft",
@@ -271,6 +434,11 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
                 outcome.final_loss,
                 &loss_json,
                 "null",
+                None,
+                None,
+                None,
+                None,
+                None,
             ) {
                 eprintln!(
                     "[train] WARNING: failed to upsert training metrics for {id} in smolgpt.db: {e}"
@@ -278,25 +446,51 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
             }
         };
 
-        // Dropout on for regular SFT; pass CLI patience/min_delta so `--train`
-        // gets early stopping by default (patience=200, min_delta=0.001). Users
-        // can disable with `--patience 0`.
+        // Dropout regularizes against overfitting a large/diverse corpus, but
+        // for a tiny, fully-memorizable corpus (e.g. a few dozen arithmetic
+        // facts) it does the opposite of what you want: it caps how low the
+        // training loss can go, since a different random subset of hidden
+        // units is zeroed on every step, so the network can never settle into
+        // the sharp, fully-confident weights needed to get every training
+        // example right at (dropout-free) inference time. `--no-dropout`
+        // turns this off for exactly that "I want to memorize a small corpus"
+        // case; leave it on (the default) for anything where held-out
+        // generalization actually matters. Pass CLI patience/min_delta so
+        // `--train` gets early stopping by default (patience=200,
+        // min_delta=0.001) — users can disable with `--patience 0`.
         let outcome = model.train_with_dropout(
             dataset,
             &model_path,
             epochs,
             num_batches,
-            true,
+            !no_dropout,
             patience,
             min_delta,
             Some(&mut on_checkpoint),
+            lr,
+            mask_loss,
+            Some(&mut on_best_loss),
         )?;
         println!("Training completed in {:.2?}", now.elapsed());
+
+        // Exact greedy-decoding accuracy over the literal training corpus
+        // (distinct from --eval's random-sampled-range accuracy) so the UI
+        // can show a real "how much of what it was trained on did it
+        // actually learn" number instead of just the opaque final loss.
+        let (train_correct, train_total) =
+            crate::eval::eval_corpus_exact(&model, tokenizer.as_ref(), &device, &corpus, block_size)?;
+        let train_pct = if train_total > 0 {
+            train_correct as f64 * 100.0 / train_total as f64
+        } else {
+            0.0
+        };
+        println!("Training-set accuracy: {train_correct}/{train_total} ({train_pct:.2}%)");
 
         // Final register_model upserts the model row with the complete
         // outcome (epochs_run, early_stopped, final note). The final
         // on_checkpoint callback already upserted the trainings row inside
-        // train_with_dropout, so the loss trajectory is current.
+        // train_with_dropout, so the loss trajectory is current; this upsert
+        // adds the training-set accuracy now that it's been computed.
         if let Ok(reg) = &reg {
             let rec = crate::registry::ModelRecord::from_training(&training_meta, &outcome);
             match reg.register_model(&rec) {
@@ -304,6 +498,76 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
                 Err(e) => eprintln!(
                     "[train] WARNING: failed to register model in smolgpt.db: {e}"
                 ),
+            }
+            let loss_json = serde_json::to_string(&outcome.losses).unwrap_or_else(|e| {
+                eprintln!("[train] WARNING: failed to serialize loss trajectory: {e}; storing []");
+                "[]".to_string()
+            });
+            if let Err(e) = reg.upsert_training(
+                &rec.id,
+                "sft",
+                outcome.epochs_run,
+                outcome.early_stopped,
+                outcome.final_loss,
+                &loss_json,
+                "null",
+                Some(train_correct as i64),
+                Some(train_total as i64),
+                None,
+                None,
+                None,
+            ) {
+                eprintln!(
+                    "[train] WARNING: failed to upsert final training accuracy for {} in smolgpt.db: {e}",
+                    rec.id
+                );
+            }
+
+            // "Compiled" precompute: run the Jacobian-lens interpretability
+            // analysis right now (Gpt-only) and cache it, so `--serve`'s
+            // Jacobian tab shows an already-computed result with no on-demand
+            // click needed. Same registry row/shape the on-demand route
+            // (`serve.rs`'s `jacobian_lens_model`) writes, so a precomputed
+            // and an on-demand result are indistinguishable once cached.
+            if run_jacobian_lens_flag {
+                if !matches!(model_type, crate::args::ModelType::Gpt) {
+                    println!(
+                        "[train] --jacobian-lens ignored: only applicable to -m gpt models \
+                         (this run is -m {model_type:?})"
+                    );
+                } else {
+                    match std::env::current_dir() {
+                        Ok(project_root) => {
+                            println!("[train] Running Jacobian-lens analysis (--jacobian-lens)...");
+                            match crate::jacobian_lens::run_jacobian_lens_for_model(&rec, &project_root) {
+                                Ok(outcome) => {
+                                    if let Err(e) = reg.record_jacobian_lens(
+                                        &rec.id,
+                                        &outcome.results_json,
+                                        &outcome.plot_dir_rel,
+                                        &outcome.plot_files,
+                                    ) {
+                                        eprintln!(
+                                            "[train] WARNING: failed to cache jacobian-lens result for {}: {e}",
+                                            rec.id
+                                        );
+                                    } else {
+                                        println!(
+                                            "[train] Jacobian-lens analysis cached for {} ({} plots)",
+                                            rec.id,
+                                            outcome.plot_files.len()
+                                        );
+                                    }
+                                }
+                                Err(e) => eprintln!(
+                                    "[train] WARNING: --jacobian-lens analysis failed for {}: {e}",
+                                    rec.id
+                                ),
+                            }
+                        }
+                        Err(e) => eprintln!("[train] WARNING: --jacobian-lens skipped, cwd unavailable: {e}"),
+                    }
+                }
             }
         }
     }
@@ -441,6 +705,11 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
                 rft_final_loss,
                 "null",
                 &summary_json,
+                None,
+                None,
+                Some(rft_min),
+                Some(rft_max),
+                Some(&rft_ops),
             ) {
                 eprintln!(
                     "[rft] WARNING: failed to upsert RFT metrics for {} in smolgpt.db: {e}",
@@ -488,8 +757,17 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
         // place). The model was loaded from `model_path` (the base) above;
         // `run_grpo` mutates it in-place and saves to `variant_path` each
         // round.
+        //
+        // The suffix includes the mode (`-grpo` for lite, `-grpo-full` for
+        // full/PPO-style) so a `--grpo-mode full` run never collides with an
+        // existing lite run's `.bin` file or registry id — they're sibling
+        // variants of the same base, not the same variant re-trained.
+        let grpo_suffix = match grpo_mode {
+            crate::args::GrpoMode::Lite => "grpo",
+            crate::args::GrpoMode::Full => "grpo-full",
+        };
         let variant_path =
-            crate::registry::derive_variant_path(&model_path, "grpo");
+            crate::registry::derive_variant_path(&model_path, grpo_suffix);
         let base_id = crate::registry::derive_id(&model_path);
         let variant_id = crate::registry::derive_id(&variant_path);
         println!(
@@ -547,6 +825,11 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
                 grpo_final_loss,
                 "null",
                 &summary_json,
+                None,
+                None,
+                Some(grpo_min),
+                Some(grpo_max),
+                Some(&grpo_ops),
             ) {
                 eprintln!(
                     "[grpo] WARNING: failed to upsert GRPO metrics for {} in smolgpt.db: {e}",
@@ -588,6 +871,118 @@ pub fn do_training(args: Args) -> Result<(), SmolError> {
             "GRPO complete: {} rounds, final PG loss {:.6}",
             summary.rounds, grpo_final_loss
         );
+    }
+
+    if quantize {
+        // Derive a variant path so the base `.bin` is preserved and the
+        // quantized copy is a separate file — same "no override" rule
+        // `--rft`/`--grpo` follow. `model` was already loaded (in f32) from
+        // `model_path` (the base) above; it is NOT mutated here, only its
+        // in-memory weights are quantized and written out to `variant_path`.
+        let variant_path = crate::registry::derive_variant_path(&model_path, "quant");
+        let base_id = crate::registry::derive_id(&model_path);
+        let variant_id = crate::registry::derive_id(&variant_path);
+        println!(
+            "Quantizing {model_type:?} model (base {}) → variant {}",
+            model_path.display(),
+            variant_path.display()
+        );
+
+        model.save_quantized(&variant_path)?;
+
+        let base_size = std::fs::metadata(&model_path).map(|m| m.len()).unwrap_or(0);
+        let quant_size = std::fs::metadata(&variant_path).map(|m| m.len()).unwrap_or(0);
+        let reduction_pct = if base_size > 0 {
+            100.0 * (1.0 - (quant_size as f64 / base_size as f64))
+        } else {
+            0.0
+        };
+        println!(
+            "Quantization complete: {} ({base_size} bytes) -> {} ({quant_size} bytes), \
+             {reduction_pct:.1}% smaller",
+            model_path.display(),
+            variant_path.display()
+        );
+
+        // Re-run the exact training-corpus accuracy check against the
+        // quantized variant (loaded fresh from disk, so this exercises the
+        // real dequantize-on-load path, not just the in-memory `model`) so
+        // the registered note carries a real "quantized accuracy" number
+        // rather than assuming it's unchanged from the base.
+        let quantized_model = LanguageModel::load(
+            model_type,
+            &variant_path,
+            block_size,
+            vocab_size,
+            hidden_size,
+            &num_heads,
+            num_blocks,
+            tie_embeddings,
+            &device,
+        )?;
+        let (quant_correct, quant_total) = crate::eval::eval_corpus_exact(
+            &quantized_model,
+            tokenizer.as_ref(),
+            &device,
+            &corpus,
+            block_size,
+        )?;
+        let quant_pct = if quant_total > 0 {
+            quant_correct as f64 * 100.0 / quant_total as f64
+        } else {
+            0.0
+        };
+        println!(
+            "Quantized model training-set accuracy: {quant_correct}/{quant_total} ({quant_pct:.2}%)"
+        );
+
+        let quant_meta = training_meta.with_variant(&variant_path, &base_id);
+        let note = format!(
+            "INT8-quantized copy of '{base_id}' (per-tensor symmetric scale = \
+             max(abs(x))/127, values stored as i8, dequantized to f32 on load; \
+             custom binary format, see src/quantize.rs). File size: {base_size} \
+             -> {quant_size} bytes ({reduction_pct:.1}% smaller). Training-set \
+             exact-match accuracy: {quant_correct}/{quant_total} ({quant_pct:.2}%) \
+             vs the unquantized base."
+        );
+
+        match crate::registry::Registry::open() {
+            Ok(reg) => {
+                let placeholder = crate::model::TrainOutcome::placeholder();
+                let mut rec = crate::registry::ModelRecord::from_training(&quant_meta, &placeholder);
+                rec.note = note;
+                match reg.register_model(&rec) {
+                    Ok(()) => println!(
+                        "Registered quantized variant {} (base {}) in smolgpt.db",
+                        variant_id, base_id
+                    ),
+                    Err(e) => eprintln!(
+                        "[quantize] WARNING: failed to register quantized variant {variant_id} \
+                         in smolgpt.db: {e}"
+                    ),
+                }
+                if let Err(e) = reg.upsert_training(
+                    &variant_id,
+                    "sft",
+                    0,
+                    false,
+                    0.0,
+                    "[]",
+                    "null",
+                    Some(quant_correct as i64),
+                    Some(quant_total as i64),
+                    None,
+                    None,
+                    None,
+                ) {
+                    eprintln!(
+                        "[quantize] WARNING: failed to upsert training accuracy for \
+                         {variant_id} in smolgpt.db: {e}"
+                    );
+                }
+            }
+            Err(e) => eprintln!("[quantize] WARNING: failed to open smolgpt.db: {e}"),
+        }
     }
 
     Ok(())

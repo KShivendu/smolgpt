@@ -93,6 +93,36 @@ pub fn parse_ops(ops: &str) -> SmolResult<Vec<char>> {
     Ok(out)
 }
 
+/// Fixed seed for `sample_example_prompts`'s RNG, mirroring
+/// `dataset::EXAMPLE_WINDOWS_SEED` -- a UI-facing reconstruction, not an
+/// actual training/sampling step, so a stable seed keeps repeated page loads
+/// showing the same examples instead of a fresh random set every time.
+const EXAMPLE_PROMPTS_SEED: u64 = 0x50_52_4f_4d_50_54_53; // arbitrary constant
+
+/// Reconstruct `count` representative RFT/GRPO-style prompts (`"a op b="`),
+/// given the operand range and ops actually registered for that stage, for
+/// `--serve`'s Samples tab. Mirrors the exact prompt-sampling shape
+/// `rft::run_rft` and `grpo::run_grpo` use (`a`/`b` uniform in `[min, max]`,
+/// `op` uniform over the parsed ops list) with a fixed seed so the UI is
+/// stable across reloads -- this is a read-only reconstruction for display,
+/// not a real sampling step, so it doesn't share an RNG stream with the
+/// actual RFT/GRPO loops.
+pub fn sample_example_prompts(min: i64, max: i64, ops: &str, count: usize) -> SmolResult<Vec<String>> {
+    if min > max || count == 0 {
+        return Ok(Vec::new());
+    }
+    let ops_list = parse_ops(ops)?;
+    let mut rng = StdRng::seed_from_u64(EXAMPLE_PROMPTS_SEED);
+    Ok((0..count)
+        .map(|_| {
+            let a: i64 = rng.random_range(min..=max);
+            let b: i64 = rng.random_range(min..=max);
+            let op: char = ops_list[rng.random_range(0..ops_list.len())];
+            format!("{a}{op}{b}=")
+        })
+        .collect())
+}
+
 /// Map a true arithmetic answer to a `by_digits` bucket index by counting the
 /// digits in its absolute value:
 ///   - 1-digit answer  (`0..=9`, `-9..=-1`)  -> 0
@@ -209,6 +239,229 @@ pub fn run_eval(
     Ok(report)
 }
 
+/// Split an `a op b=c` corpus line into its prompt (`"a op b="`) and true
+/// answer `c`. Returns `None` for lines that don't contain exactly one `=`
+/// with non-empty content on both sides (blank lines, malformed lines).
+fn split_prompt_and_answer(line: &str) -> Option<(String, i64)> {
+    let mut parts = line.splitn(2, '=');
+    let lhs = parts.next()?;
+    let rhs = parts.next()?;
+    if lhs.is_empty() || rhs.is_empty() {
+        return None;
+    }
+    let answer: i64 = rhs.trim().parse().ok()?;
+    Some((format!("{lhs}="), answer))
+}
+
+/// Exact greedy-decoding accuracy over every parseable line of `corpus`
+/// itself — not sampled, the literal training set. Distinct from `run_eval`,
+/// which samples random `a op b` from an operand range and can include
+/// problems the corpus never actually contained. Used to report a training
+/// run's accuracy on what it was actually trained on (e.g. "42/55 (76.4%)"
+/// alongside "trained N epochs / final loss X").
+pub fn eval_corpus_exact(
+    model: &LanguageModel,
+    tokenizer: &dyn Tokenizer<u32>,
+    device: &Device,
+    corpus: &str,
+    block_size: usize,
+) -> SmolResult<(usize, usize)> {
+    let newline_token: u32 = tokenizer
+        .encode("\n")
+        .into_iter()
+        .next()
+        .ok_or_else(|| SmolError::invalid_argument("Tokenizer produced no encoding for '\\n'"))?;
+
+    let mut correct = 0usize;
+    let mut total = 0usize;
+    for raw_line in corpus.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((prompt, true_answer)) = split_prompt_and_answer(line) else {
+            continue;
+        };
+        let prompt_ids = tokenizer.encode(&prompt);
+        let generated_ids =
+            model.generate_greedy_from_prompt(&prompt_ids, block_size, newline_token, device)?;
+        let generated_str = tokenizer.decode(&generated_ids);
+        let parsed = parse_leading_int(&generated_str);
+
+        total += 1;
+        if parsed == Some(true_answer) {
+            correct += 1;
+        }
+    }
+
+    Ok((correct, total))
+}
+
+/// Per-axis cap on an exhaustive eval grid: `(max - min + 1)` must not exceed
+/// this on either axis, i.e. at most `MAX_GRID_AXIS^2` cells per operator grid.
+/// Greedy-decoding one cell at a time is the bottleneck (it's a full forward
+/// pass per generated token, not a batched matmul), so a naive grid over a
+/// large operand range (e.g. `[0,999]` -> 1M cells) would hang the server for
+/// minutes. 50 comfortably covers this project's actual registered models
+/// (almost all are trained on `[0,9]` or `[0,49]` operand ranges; 50x50 = 2500
+/// cells is a few seconds on CPU) while still rejecting the couple of
+/// 3-digit-range models (e.g. `[0,99]` -> 100x100 = 10000, over the cap) with
+/// a clear error instead of silently truncating or hanging.
+pub const MAX_GRID_AXIS: i64 = 50;
+
+/// One cell of an exhaustive eval grid: the operands, the prompt, the model's
+/// raw greedy-decoded completion, the true answer, whether they match, and
+/// the signed numeric error. Public so `--serve` can serialize it to JSON for
+/// the grid UI.
+///
+/// `diff` is `parsed_answer - true_answer` when the model's completion parses
+/// to an integer (via `parse_leading_int`), and `None` when it doesn't (the
+/// model emitted something with no leading digits at all, e.g. garbage or an
+/// empty completion). `None` is intentionally NOT coerced to some large
+/// sentinel number: a numeric diff implies "the model attempted arithmetic
+/// and landed some distance from the right answer", which is a fundamentally
+/// different failure mode from "the model didn't even produce a parseable
+/// number" — collapsing them into one numeric scale would hide that
+/// distinction. Consumers of the gradient color mode (the Grid tab UI) treat
+/// `None` as its own worst-case bucket (rendered with a distinct
+/// hatched/striped style) rather than picking an arbitrary numeric stand-in.
+/// `correct` is equivalent to `diff == Some(0)`, kept as its own field so the
+/// pass/fail grid mode doesn't need to special-case `Option` unwrapping.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GridCell {
+    pub a: i64,
+    pub b: i64,
+    pub prompt: String,
+    pub generated: String,
+    pub true_answer: i64,
+    pub correct: bool,
+    pub diff: Option<i64>,
+}
+
+/// One operator's exhaustive grid: every `(a, b)` in `[min, max] x [min, max]`
+/// for that operator, plus a per-grid accuracy summary. `cells` is flattened
+/// row-major (`a` varies slowest, matching the row axis of the rendered
+/// table): index `(a - min) * (max - min + 1) + (b - min)`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OpGrid {
+    pub op: char,
+    pub cells: Vec<GridCell>,
+    pub correct: usize,
+    pub total: usize,
+}
+
+/// Full exhaustive-eval report: one `OpGrid` per configured operator, plus an
+/// overall accuracy rollup across all grids.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EvalGridReport {
+    pub min: i64,
+    pub max: i64,
+    pub grids: Vec<OpGrid>,
+    pub correct: usize,
+    pub total: usize,
+}
+
+/// Exhaustively evaluate every `(a, b, op)` combination in
+/// `[min, max] x [min, max] x ops` — no sampling. One grid per operator, so a
+/// model trained on `+,-` gets two separate grids rather than one grid
+/// conflating both operators.
+///
+/// Returns `Err` (rather than silently truncating or running for a very long
+/// time) if `(max - min + 1)` exceeds `MAX_GRID_AXIS` on either axis — see
+/// that constant's doc for the cap rationale. Callers (the `--serve` HTTP
+/// handler) should surface this error message directly to the user rather
+/// than treating it as an unexpected 500: it's an expected, actionable
+/// "range too large, use the sampled Eval tab instead" outcome.
+///
+/// Reuses the same tokenizer/model/newline-stop-token/`parse_leading_int`
+/// machinery as `run_eval` so "what counts as correct" is identical between
+/// the sampled and exhaustive eval paths.
+pub fn run_eval_grid(
+    model: &LanguageModel,
+    tokenizer: &dyn Tokenizer<u32>,
+    device: &Device,
+    min: i64,
+    max: i64,
+    block_size: usize,
+    ops: &str,
+) -> SmolResult<EvalGridReport> {
+    if min > max {
+        return Err(SmolError::invalid_argument(&format!(
+            "--eval-min ({min}) must be <= --eval-max ({max})"
+        )));
+    }
+    let axis = max - min + 1;
+    if axis > MAX_GRID_AXIS {
+        return Err(SmolError::invalid_argument(&format!(
+            "range too large for an exhaustive grid: {axis}x{axis} operand \
+             combinations exceeds the cap of {MAX_GRID_AXIS}x{MAX_GRID_AXIS}; \
+             use the sampled Eval tab instead"
+        )));
+    }
+
+    let newline_token: u32 = tokenizer
+        .encode("\n")
+        .into_iter()
+        .next()
+        .ok_or_else(|| SmolError::invalid_argument("Tokenizer produced no encoding for '\\n'"))?;
+
+    let ops_list: Vec<char> = parse_ops(ops)?;
+    let mut grids = Vec::with_capacity(ops_list.len());
+    let mut overall_correct = 0usize;
+    let mut overall_total = 0usize;
+
+    for op in ops_list {
+        let mut cells = Vec::with_capacity((axis * axis) as usize);
+        let mut correct = 0usize;
+        for a in min..=max {
+            for b in min..=max {
+                let true_answer: i64 = if op == '+' { a + b } else { a - b };
+                let prompt = format!("{a}{op}{b}=");
+                let prompt_ids = tokenizer.encode(&prompt);
+                let generated_ids = model.generate_greedy_from_prompt(
+                    &prompt_ids,
+                    block_size,
+                    newline_token,
+                    device,
+                )?;
+                let generated_str = tokenizer.decode(&generated_ids);
+                let parsed = parse_leading_int(&generated_str);
+                let is_correct = parsed == Some(true_answer);
+                let diff = parsed.map(|p| p - true_answer);
+                if is_correct {
+                    correct += 1;
+                }
+                cells.push(GridCell {
+                    a,
+                    b,
+                    prompt,
+                    generated: generated_str,
+                    true_answer,
+                    correct: is_correct,
+                    diff,
+                });
+            }
+        }
+        let total = cells.len();
+        overall_correct += correct;
+        overall_total += total;
+        grids.push(OpGrid {
+            op,
+            cells,
+            correct,
+            total,
+        });
+    }
+
+    Ok(EvalGridReport {
+        min,
+        max,
+        grids,
+        correct: overall_correct,
+        total: overall_total,
+    })
+}
+
 /// Print the eval report and up to 10 worked examples.
 fn print_report(report: &EvalReport, examples: &[EvalExample]) {
     let pct = if report.total > 0 {
@@ -298,6 +551,38 @@ pub fn parse_leading_int(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_sample_example_prompts_shape_and_range() {
+        let prompts = sample_example_prompts(0, 9, "+,-", 20).unwrap();
+        assert_eq!(prompts.len(), 20);
+        for p in &prompts {
+            assert!(p.ends_with('='), "prompt {p:?} should end with '='");
+            let body = &p[..p.len() - 1];
+            let op_pos = body[1..].find(|c| c == '+' || c == '-').map(|i| i + 1).unwrap();
+            let a: i64 = body[..op_pos].parse().unwrap();
+            let b: i64 = body[op_pos + 1..].parse().unwrap();
+            assert!((0..=9).contains(&a), "a={a} out of range in {p:?}");
+            assert!((0..=9).contains(&b), "b={b} out of range in {p:?}");
+        }
+    }
+
+    #[test]
+    fn test_sample_example_prompts_deterministic() {
+        let a = sample_example_prompts(0, 99, "+,-", 10).unwrap();
+        let b = sample_example_prompts(0, 99, "+,-", 10).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_sample_example_prompts_rejects_bad_ops() {
+        assert!(sample_example_prompts(0, 9, "*", 5).is_err());
+    }
+
+    #[test]
+    fn test_sample_example_prompts_empty_for_zero_count() {
+        assert_eq!(sample_example_prompts(0, 9, "+,-", 0).unwrap(), Vec::<String>::new());
+    }
 
     #[test]
     fn test_parse_leading_int_positive() {
