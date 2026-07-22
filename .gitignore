@@ -17,3 +17,7 @@ jacobian_lens_output/
 __pycache__/
 *.pyc
 analysis/output/
+# Python port: torch checkpoints and uv virtualenv.
+*.pt
+python/.venv/
+.pytest_cache/
